@@ -154,238 +154,10 @@ macro PLIT(label) {
 }
 
 // ==========================================================================
-// .rodata : format strings, literals, self-test vectors.
-// Each db call appends the trailing newline and NUL terminator explicitly;
-// XIRASM does not add a terminator automatically.
-// ==========================================================================
-format_segment_begin(image, ".rodata")
-
-f_fde:
-    db(FMT_FDE, MB_NEWLINE, 0)
-f_unknown:
-    db(FMT_UNKNOWN, MB_NEWLINE, 0)
-f_gtid:
-    db(FMT_GTID, MB_NEWLINE, 0)
-f_query:
-    db(FMT_QUERY, MB_NEWLINE, 0)
-f_rowsquery:
-    db(FMT_ROWSQUERY, MB_NEWLINE, 0)
-f_tmap1:
-    db(FMT_TMAP1, 0)
-f_tmap2:
-    db(FMT_TMAP2, 0)
-f_rows1:
-    db(FMT_ROWS1, 0)
-f_rows2:
-    db(FMT_ROWS2, 0)
-f_xid:
-    db(FMT_XID, MB_NEWLINE, 0)
-f_rotate:
-    db(FMT_ROTATE, MB_NEWLINE, 0)
-f_qstr:
-    db(FMT_QSTR, 0)
-f_num:
-    db(FMT_NUM, 0)
-
-f_comma:
-    db(LIT_COMMA, 0)
-f_lbrack:
-    db(LIT_LBRACK, 0)
-f_rbrack:
-    db(LIT_RBRACK, 0)
-f_null:
-    db(LIT_NULL, 0)
-f_endrows:
-    db(LIT_ENDROWS, MB_NEWLINE, 0)
-lit_write:
-    db(LIT_WRITE, 0)
-lit_update:
-    db(LIT_UPDATE, 0)
-lit_delete:
-    db(LIT_DELETE, 0)
-
-lit_file:
-    db(LIT_FILEOPT, 0)
-lit_selftest:
-    db(LIT_SELFTEST, 0)
-lit_help:
-    db(LIT_HELPOPT, 0)
-lit_rb:
-    db(LIT_RB, 0)
-hexchars:
-    db(LIT_HEX)
-
-lit_usage:
-    db(MSG_USAGE, MB_NEWLINE, 0)
-lit_openfail:
-    db(MSG_OPENFAIL, MB_NEWLINE, 0)
-lit_badmagic:
-    db(MSG_BADMAGIC, MB_NEWLINE, 0)
-lit_truncated:
-    db(MSG_TRUNCATED, MB_NEWLINE, 0)
-lit_checksum:
-    db(MSG_CHECKSUM, MB_NEWLINE, 0)
-lit_noschema:
-    db(MSG_NOSCHEMA, MB_NEWLINE, 0)
-lit_unsupported:
-    db(MSG_UNSUPPORTED, MB_NEWLINE, 0)
-lit_st_ok:
-    db(MSG_ST_OK, MB_NEWLINE, 0)
-lit_st_fail:
-    db(MSG_ST_FAIL, MB_NEWLINE, 0)
-
-// CRC-32 standard vector "123456789" (9 bytes, not NUL-terminated).
-lit_crcvec:
-    db('123456789')
-
-// Hand-built 19-byte header used by --self-test.
-hdr_test:
-    dd(1700000000)
-    db(MB_EV_FORMAT_DESC)
-    dd(1)
-    dd(119)
-    dd(123)
-    dw(0)
-
-format_segment_end(image, ".rodata")
-
-// ==========================================================================
-// [4] SchemaRegistry + parser state. All state is in .bss because libc calls
-// clobber the caller-saved registers; nothing survives a call in a register.
-// ==========================================================================
-format_segment_begin(image, ".bss")
-
-inbuf:
-    rb(MB_INBUF_CAP)
-tmp:
-    rb(MB_TMP_CAP)
-
-argc_g:
-    rq(1)
-argv_g:
-    rq(1)
-path:
-    rq(1)
-fp:
-    rq(1)
-inlen:
-    rq(1)
-pos:
-    rq(1)
-ev_size:
-    rq(1)
-etype:
-    rq(1)
-stamps:
-    rq(1)
-body:
-    rq(1)
-blen:
-    rq(1)
-cur:
-    rq(1)
-brem:
-    rq(1)
-calccrc:
-    rd(1)
-
-// --- SchemaRegistry: one table entry (matches the controlled subset) ---
-schema_ok:
-    rq(1)
-schema_tid:
-    rq(1)
-schema_db:
-    rq(1)
-schema_dblen:
-    rq(1)
-schema_tbl:
-    rq(1)
-schema_tbllen:
-    rq(1)
-schema_cc:
-    rq(1)
-schema_nullable:
-    rq(1)
-schema_types:
-    rb(MB_MAX_COLS)
-schema_vlen:
-    rb(MB_MAX_COLS)
-
-// --- per-handler scratch (named, like C locals in a file-scope struct) ---
-f_bv:
-    rq(1)
-f_alg:
-    rq(1)
-svptr:
-    rq(1)
-svlen:
-    rq(1)
-g_sidptr:
-    rq(1)
-g_gno:
-    rq(1)
-q_dbl:
-    rq(1)
-q_svl:
-    rq(1)
-q_dbp:
-    rq(1)
-q_ql:
-    rq(1)
-q_qp:
-    rq(1)
-rq_len:
-    rq(1)
-rq_ptr:
-    rq(1)
-t_tid:
-    rq(1)
-t_dbl:
-    rq(1)
-t_dbp:
-    rq(1)
-t_tbl:
-    rq(1)
-t_tbp:
-    rq(1)
-t_cc:
-    rq(1)
-t_i:
-    rq(1)
-t_mdlen:
-    rq(1)
-t_mdstart:
-    rq(1)
-t_nb:
-    rq(1)
-t_nullbm:
-    rq(1)
-t_nullable:
-    rq(1)
-t_lb:
-    rb(1)
-r_tid:
-    rq(1)
-r_cc:
-    rq(1)
-r_bm:
-    rq(1)
-r_present:
-    rq(1)
-r_nbs:
-    rq(1)
-r_nullbm:
-    rq(1)
-r_slen:
-    rq(1)
-typename:
-    rq(1)
-
-format_segment_end(image, ".bss")
-
-// ==========================================================================
-// [2]/[3] Leaf helpers (never call libc, so stack alignment is irrelevant).
-// One shared little-endian loop for every read -- a function, not a macro.
+// [2]/[3] ByteReader / CRC-32 / [5] RowDecoder / [6] EventParser / [8] CLI.
+// Leaf helpers never call libc, so stack alignment is irrelevant; the shared
+// le_n loop is one function rather than an inlined macro. Emitted first:
+// a dynamic ELF requires its row-0 LOAD segment to open first.
 // ==========================================================================
 format_segment_begin(image, ".text")
 
@@ -1203,6 +975,238 @@ done_ok:
     call exit_plt
 
 format_segment_end(image, ".text")
+
+// ==========================================================================
+// [7] Serializer: format strings, literals, self-test vectors.
+// Each db call appends the trailing newline and NUL terminator explicitly;
+// XIRASM does not add a terminator automatically.
+// ==========================================================================
+format_segment_begin(image, ".rodata")
+
+f_fde:
+    db(FMT_FDE, MB_NEWLINE, 0)
+f_unknown:
+    db(FMT_UNKNOWN, MB_NEWLINE, 0)
+f_gtid:
+    db(FMT_GTID, MB_NEWLINE, 0)
+f_query:
+    db(FMT_QUERY, MB_NEWLINE, 0)
+f_rowsquery:
+    db(FMT_ROWSQUERY, MB_NEWLINE, 0)
+f_tmap1:
+    db(FMT_TMAP1, 0)
+f_tmap2:
+    db(FMT_TMAP2, 0)
+f_rows1:
+    db(FMT_ROWS1, 0)
+f_rows2:
+    db(FMT_ROWS2, 0)
+f_xid:
+    db(FMT_XID, MB_NEWLINE, 0)
+f_rotate:
+    db(FMT_ROTATE, MB_NEWLINE, 0)
+f_qstr:
+    db(FMT_QSTR, 0)
+f_num:
+    db(FMT_NUM, 0)
+
+f_comma:
+    db(LIT_COMMA, 0)
+f_lbrack:
+    db(LIT_LBRACK, 0)
+f_rbrack:
+    db(LIT_RBRACK, 0)
+f_null:
+    db(LIT_NULL, 0)
+f_endrows:
+    db(LIT_ENDROWS, MB_NEWLINE, 0)
+lit_write:
+    db(LIT_WRITE, 0)
+lit_update:
+    db(LIT_UPDATE, 0)
+lit_delete:
+    db(LIT_DELETE, 0)
+
+lit_file:
+    db(LIT_FILEOPT, 0)
+lit_selftest:
+    db(LIT_SELFTEST, 0)
+lit_help:
+    db(LIT_HELPOPT, 0)
+lit_rb:
+    db(LIT_RB, 0)
+hexchars:
+    db(LIT_HEX)
+
+lit_usage:
+    db(MSG_USAGE, MB_NEWLINE, 0)
+lit_openfail:
+    db(MSG_OPENFAIL, MB_NEWLINE, 0)
+lit_badmagic:
+    db(MSG_BADMAGIC, MB_NEWLINE, 0)
+lit_truncated:
+    db(MSG_TRUNCATED, MB_NEWLINE, 0)
+lit_checksum:
+    db(MSG_CHECKSUM, MB_NEWLINE, 0)
+lit_noschema:
+    db(MSG_NOSCHEMA, MB_NEWLINE, 0)
+lit_unsupported:
+    db(MSG_UNSUPPORTED, MB_NEWLINE, 0)
+lit_st_ok:
+    db(MSG_ST_OK, MB_NEWLINE, 0)
+lit_st_fail:
+    db(MSG_ST_FAIL, MB_NEWLINE, 0)
+
+// CRC-32 standard vector "123456789" (9 bytes, not NUL-terminated).
+lit_crcvec:
+    db('123456789')
+
+// Hand-built 19-byte header used by --self-test.
+hdr_test:
+    dd(1700000000)
+    db(MB_EV_FORMAT_DESC)
+    dd(1)
+    dd(119)
+    dd(123)
+    dw(0)
+
+format_segment_end(image, ".rodata")
+
+
+// ==========================================================================
+// [4] SchemaRegistry + parser state. All state is in .bss because libc calls
+// clobber the caller-saved registers; nothing survives a call in a register.
+// ==========================================================================
+format_segment_begin(image, ".bss")
+
+inbuf:
+    rb(MB_INBUF_CAP)
+tmp:
+    rb(MB_TMP_CAP)
+
+argc_g:
+    rq(1)
+argv_g:
+    rq(1)
+path:
+    rq(1)
+fp:
+    rq(1)
+inlen:
+    rq(1)
+pos:
+    rq(1)
+ev_size:
+    rq(1)
+etype:
+    rq(1)
+stamps:
+    rq(1)
+body:
+    rq(1)
+blen:
+    rq(1)
+cur:
+    rq(1)
+brem:
+    rq(1)
+calccrc:
+    rd(1)
+
+// --- SchemaRegistry: one table entry (matches the controlled subset) ---
+schema_ok:
+    rq(1)
+schema_tid:
+    rq(1)
+schema_db:
+    rq(1)
+schema_dblen:
+    rq(1)
+schema_tbl:
+    rq(1)
+schema_tbllen:
+    rq(1)
+schema_cc:
+    rq(1)
+schema_nullable:
+    rq(1)
+schema_types:
+    rb(MB_MAX_COLS)
+schema_vlen:
+    rb(MB_MAX_COLS)
+
+// --- per-handler scratch (named, like C locals in a file-scope struct) ---
+f_bv:
+    rq(1)
+f_alg:
+    rq(1)
+svptr:
+    rq(1)
+svlen:
+    rq(1)
+g_sidptr:
+    rq(1)
+g_gno:
+    rq(1)
+q_dbl:
+    rq(1)
+q_svl:
+    rq(1)
+q_dbp:
+    rq(1)
+q_ql:
+    rq(1)
+q_qp:
+    rq(1)
+rq_len:
+    rq(1)
+rq_ptr:
+    rq(1)
+t_tid:
+    rq(1)
+t_dbl:
+    rq(1)
+t_dbp:
+    rq(1)
+t_tbl:
+    rq(1)
+t_tbp:
+    rq(1)
+t_cc:
+    rq(1)
+t_i:
+    rq(1)
+t_mdlen:
+    rq(1)
+t_mdstart:
+    rq(1)
+t_nb:
+    rq(1)
+t_nullbm:
+    rq(1)
+t_nullable:
+    rq(1)
+t_lb:
+    rb(1)
+r_tid:
+    rq(1)
+r_cc:
+    rq(1)
+r_bm:
+    rq(1)
+r_present:
+    rq(1)
+r_nbs:
+    rq(1)
+r_nullbm:
+    rq(1)
+r_slen:
+    rq(1)
+typename:
+    rq(1)
+
+format_segment_end(image, ".bss")
+
 
 format_entry_mut(image, main)
 format_finish(image)
