@@ -1,5 +1,9 @@
 ; ---------------------------------------------------------------------------
-; mysqlbinlog-asm : Phase 1 offline MySQL binlog parser in x86-64 NASM.
+; LEGACY REFERENCE ONLY -- no longer built by CI.
+;
+; The active implementation is asm/main.xir (XIRASM 0.3.5), which emits the
+; ELF64 executable directly via format.inc. This NASM + libc version is kept
+; as a byte-level reference for the parser logic and as a rollback target.
 ;
 ; Build (CI only, never locally):
 ;   nasm -felf64 asm/main.asm -o asm/main.o

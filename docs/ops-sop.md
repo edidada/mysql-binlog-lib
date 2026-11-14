@@ -4,7 +4,7 @@
 
 ## 0. 关键约束：本地不编译
 
-本项目约定 **本地不做任何编译/构建**（不执行 `cmake --build` / `cargo build` / `go build` / `javac` / `dotnet build` / `zig build` / `erlc` / `nasm` / `gcc` 等）。
+本项目约定 **本地不做任何编译/构建**（不执行 `cmake --build` / `cargo build` / `go build` / `javac` / `dotnet build` / `zig build` / `erlc` / `xirasm` / `nasm` / `gcc` 等）。
 所有编译、运行、测试、golden 比对均由 `.github/workflows/ci.yml` 在 GitHub Actions（ubuntu-latest）完成。
 
 - 本地仅允许：编辑源码、编写文档、**运行 `fixtures/gen_fixture.py` 生成测试数据**（数据生成，非编译）、`git` 操作、`gh` 查看 CI。
@@ -18,12 +18,12 @@
 | 文件 | `.github/workflows/ci.yml` |
 | 触发 | `push` / `pull_request` / `workflow_dispatch` |
 | Runner | `ubuntu-latest`，矩阵 `lang ∈ {c, cpp, rust, go, java, csharp, zig, erlang, python, asm}` |
-| 工具链 | cmake+gcc/g++（预装）、`dtolnay/rust-toolchain@stable`、`actions/setup-go@v5`(1.23)、`actions/setup-java@v4`(temurin 21)、`actions/setup-dotnet@v4`(8.0.x)、`mlugg/setup-zig@v1`(0.13.0)、`actions/setup-python@v5`(3.12)、`apt erlang`、`apt nasm` |
+| 工具链 | cmake+gcc/g++（预装）、`dtolnay/rust-toolchain@stable`、`actions/setup-go@v5`(1.23)、`actions/setup-java@v4`(temurin 21)、`actions/setup-dotnet@v4`(8.0.x)、`mlugg/setup-zig@v1`(0.13.0)、`actions/setup-python@v5`(3.12)、`apt erlang`、`xirasm 0.3.5 release 包（curl 下载）` |
 | 权限 | `contents: read` |
 
 每个 job 固定步骤：checkout → 装工具链（`if: matrix.lang == ...`）→ 打印版本 → 生成并校验 fixtures → 该语言的「构建 + 单测 + 运行 CLI > out.jsonl」→ 共用 `diff -u expected.jsonl out.jsonl`。条件步骤在其它 job 中显示为 skipped，属正常。
 
-> 工具链版本一律在 `ci.yml` 显式钉住；Erlang / NASM 用 apt 安装以避免额外 action 依赖。
+> 工具链版本一律在 `ci.yml` 显式钉住；Erlang 用 apt 安装，XIRASM 从 [官网](https://xirasm-site.pages.dev/) 下载钉死版本的 release 包（内含 `include/` 库，`format.inc` 由此解析）。压缩包较大，`curl` 带 `--retry 5 --retry-all-errors --max-time 600`。
 
 常用命令：
 
@@ -43,7 +43,7 @@ gh workflow run ci.yml                 # 手动触发（workflow_dispatch）
    - **单测失败**：核对 CRC32 / 事件头 / 行解码断言；`crc32("123456789")==0xCBF43926` 是标准向量。
    - **golden diff 失败**：对比 `expected.jsonl` 与实际输出，**diff 会精确指出哪一行不一致**；**不得**改 `expected.jsonl` 去迁就实现，先确认解码逻辑。canonical 键序/无空格规则见 design.md §5。
    - **`git diff --exit-code` fixtures 失败**：说明提交的 `demo.bin`/`expected.jsonl` 与 `gen_fixture.py` 不一致（或行尾被 CRLF 污染，检查 `.gitattributes`）；重新生成并提交两个文件。
-   - **工具链/网络**：setup-java / setup-dotnet / setup-zig / setup-python 版本或下载异常 → 检查 action 版本与版本声明；Erlang / NASM 用 apt，失败时确认 `apt-get update` 已执行。
+   - **工具链/网络**：setup-java / setup-dotnet / setup-zig / setup-python 版本或下载异常 → 检查 action 版本与版本声明；Erlang 用 apt，失败时确认 `apt-get update` 已执行；XIRASM 下载超时 → 检查 Pages 站点可达性与 `--retry` 次数。
    - **汇编 job 段错误 / 空输出**：多为栈对齐或 printf 可变参数 `al` 未清零；核对 `main` 帧 `sub rsp,32` 与每次 `printf` 前的 `xor eax,eax`。
 3. 本地**只改代码**，不编译；`git add -A && git commit -m "fix(ci): ..." && git push` → CI 重跑。
 4. 迭代直到十个 job 全绿，确认「所有语言编译运行成功」。

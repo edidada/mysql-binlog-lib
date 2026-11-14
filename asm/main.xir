@@ -1,0 +1,1112 @@
+// ---------------------------------------------------------------------------
+// mysqlbinlog-asm : Phase 1 offline MySQL binlog parser, written in XIRASM.
+//
+// Build (CI only, never locally):
+//   xirasm asm/main.xir --isa x86-64 -o asm/mysqlbinlog-asm
+//   chmod +x asm/mysqlbinlog-asm
+//   ./asm/mysqlbinlog-asm --self-test
+//   ./asm/mysqlbinlog-asm --file fixtures/demo.bin --format jsonl
+//
+// The compile-time layer mirrors the C implementation's structure
+// (c/src/mysqlbinlog.c), so the ten-language matrix stays comparable:
+//
+//   [1] Protocol constants      named consts instead of magic numbers
+//   [2] ByteReader             one shared le_n leaf routine
+//   [3] CRC-32                 leaf routine
+//   [4] SchemaRegistry         .bss state + named offsets
+//   [5] RowDecoder             rows loop
+//   [6] EventParser            per-event handlers, dispatch table
+//   [7] Serializer             printf format strings (fixed key order)
+//   [8] CLI + self-test        argument scan, exits
+//
+// XIRASM's fn/for/if run at ASSEMBLY time. The parser's runtime logic is
+// therefore still handwritten x86-64; the C-like constructs generate its
+// bytes (constants, format strings, BSS layout) and keep the source
+// organized. format.inc emits the ELF64 image and libc PLT imports directly
+// -- no nasm/gcc toolchain.
+//
+// Strings in the controlled subset are clean ASCII (no quotes/backslashes/
+// control chars), so %.*s needs no JSON escaping to match the golden file.
+// ---------------------------------------------------------------------------
+
+import("format/format.inc")
+
+x86.use64()
+
+// ==========================================================================
+// [1] Protocol constants (docs/design.md sections 2-3). All C-like names.
+// ==========================================================================
+const MB_HEADER_SIZE:        u64 = 19
+const MB_CRC_SIZE:           u64 = 4
+const MB_MAGIC_SIZE:         u64 = 4
+const MB_MIN_EVENT_SIZE:     u64 = MB_HEADER_SIZE + MB_CRC_SIZE
+const MB_INBUF_CAP:          u64 = 65536
+const MB_TMP_CAP:            u64 = 4096
+const MB_MAX_COLS:           u64 = 64
+const MB_SERVER_VERSION_LEN: u64 = 50
+
+const MB_TYPE_LONG:          u64 = 3
+const MB_TYPE_LONGLONG:      u64 = 8
+const MB_TYPE_VARCHAR:       u64 = 15
+
+const MB_EV_QUERY:           u64 = 2
+const MB_EV_ROTATE:          u64 = 4
+const MB_EV_FORMAT_DESC:     u64 = 15
+const MB_EV_XID:             u64 = 16
+const MB_EV_TABLE_MAP:       u64 = 19
+const MB_EV_ROWS_QUERY:      u64 = 29
+const MB_EV_WRITE_ROWS:      u64 = 30
+const MB_EV_UPDATE_ROWS:     u64 = 31
+const MB_EV_DELETE_ROWS:     u64 = 32
+const MB_EV_GTID:            u64 = 33
+
+const MB_CRC32_POLY:         u32 = 0xEDB88320
+const MB_CRC32_VECTOR:       u32 = 0xCBF43926
+const MB_NEWLINE:            u8  = 10
+
+// Exact 19-byte on-disk header layout. A packed struct documents the wire
+// format; the parser decodes it field by field (never reads the struct raw).
+packed struct MbEventHeader {
+    timestamp:     u32
+    event_type:    u8
+    server_id:     u32
+    event_size:    u32
+    next_position: u32
+    flags:         u16
+}
+
+assert(sizeof(MbEventHeader) == MB_HEADER_SIZE)
+
+// ==========================================================================
+// [7] Serializer: canonical JSONL printf formats (fixed key order, no spaces).
+// ==========================================================================
+const FMT_FDE:       string = '{"type":"FORMAT_DESCRIPTION_EVENT","timestamp":%llu,"binlog_version":%llu,"server_version":"%.*s","checksum_alg":%llu}'
+const FMT_UNKNOWN:   string = '{"type":"UNKNOWN","timestamp":%llu,"type_id":%llu,"event_size":%llu}'
+const FMT_GTID:      string = '{"type":"GTID_LOG_EVENT","timestamp":%llu,"gno":%llu,"sid":"%.*s"}'
+const FMT_QUERY:     string = '{"type":"QUERY_EVENT","timestamp":%llu,"db":"%.*s","query":"%.*s"}'
+const FMT_ROWSQUERY: string = '{"type":"ROWS_QUERY_LOG_EVENT","timestamp":%llu,"query":"%.*s"}'
+const FMT_TMAP1:     string = '{"type":"TABLE_MAP_EVENT","timestamp":%llu,"table_id":%llu,"db":"%.*s"'
+const FMT_TMAP2:     string = ',"table":"%.*s","column_count":%llu,"column_types":['
+const FMT_ROWS1:     string = '{"type":"%s","timestamp":%llu,"table_id":%llu,"db":"%.*s"'
+const FMT_ROWS2:     string = ',"table":"%.*s","rows":['
+const FMT_XID:       string = '{"type":"XID_EVENT","timestamp":%llu,"xid":%llu}'
+const FMT_ROTATE:    string = '{"type":"ROTATE_EVENT","timestamp":%llu,"position":%llu,"next_file":"%.*s"}'
+const FMT_QSTR:      string = '"%.*s"'
+const FMT_NUM:       string = '%llu'
+
+const LIT_COMMA:     string = ','
+const LIT_LBRACK:    string = '['
+const LIT_RBRACK:    string = ']'
+const LIT_NULL:      string = 'null'
+const LIT_ENDROWS:   string = ']}'
+const LIT_WRITE:     string = 'WRITE_ROWS_EVENT_V2'
+const LIT_UPDATE:    string = 'UPDATE_ROWS_EVENT_V2'
+const LIT_DELETE:    string = 'DELETE_ROWS_EVENT_V2'
+
+const LIT_FILEOPT:   string = '--file'
+const LIT_SELFTEST:  string = '--self-test'
+const LIT_HELPOPT:   string = '--help'
+const LIT_RB:        string = 'rb'
+const LIT_HEX:       string = '0123456789abcdef'
+
+const MSG_USAGE:       string = 'Usage: mysqlbinlog-asm --file <path> [--format jsonl]'
+const MSG_OPENFAIL:    string = 'cannot open file'
+const MSG_BADMAGIC:    string = 'parse failed: invalid'
+const MSG_TRUNCATED:   string = 'parse failed: truncated'
+const MSG_CHECKSUM:    string = 'parse failed: checksum'
+const MSG_NOSCHEMA:    string = 'parse failed: no_schema'
+const MSG_UNSUPPORTED: string = 'parse failed: unsupported'
+const MSG_ST_OK:       string = 'asm unit tests ok'
+const MSG_ST_FAIL:     string = 'asm self-test FAILED'
+
+// ==========================================================================
+// ELF64 image + libc imports. format.inc owns headers, PLT, GOT, relocations.
+// ==========================================================================
+let image: map = format_elf64(
+    format_elf_exec,
+    list.of(
+        format_segment(".text",   format_load | format_readable | format_executable),
+        format_segment(".rodata", format_load | format_readable),
+        format_segment(".bss",    format_load | format_readable | format_writeable)
+    )
+)
+
+let imports: list = format_elfexe_import_new()
+// One grouped declaration covers every libc call the parser makes.
+format_elfexe_import_many_mut(imports, "libc.so.6", list.of(
+    "printf", "fopen", "fseek", "ftell", "fread", "fclose", "exit"
+))
+format_elfexe_tables_mut(image, imports)
+
+format_begin(image)
+
+// ==========================================================================
+// [2] ByteReader helper macro. `macro` substitutes the captured operand into
+// an instruction position and emits ONE shared leaf routine below (no private
+// labels inside the macro, which XIRASM would treat as module labels).
+//
+// printf a plain literal (no '%' inside) to stdout. eax=0 selects no SSE args.
+// ==========================================================================
+macro PLIT label {
+    lea rdi, [rel label]
+    xor eax, eax
+    call printf_plt
+}
+
+// ==========================================================================
+// .rodata : format strings, literals, self-test vectors.
+// Each db call appends the trailing newline and NUL terminator explicitly;
+// XIRASM does not add a terminator automatically.
+// ==========================================================================
+format_segment_begin(image, ".rodata")
+
+f_fde:        db(FMT_FDE, MB_NEWLINE, 0)
+f_unknown:    db(FMT_UNKNOWN, MB_NEWLINE, 0)
+f_gtid:       db(FMT_GTID, MB_NEWLINE, 0)
+f_query:      db(FMT_QUERY, MB_NEWLINE, 0)
+f_rowsquery:  db(FMT_ROWSQUERY, MB_NEWLINE, 0)
+f_tmap1:      db(FMT_TMAP1, 0)
+f_tmap2:      db(FMT_TMAP2, 0)
+f_rows1:      db(FMT_ROWS1, 0)
+f_rows2:      db(FMT_ROWS2, 0)
+f_xid:        db(FMT_XID, MB_NEWLINE, 0)
+f_rotate:     db(FMT_ROTATE, MB_NEWLINE, 0)
+f_qstr:       db(FMT_QSTR, 0)
+f_num:        db(FMT_NUM, 0)
+
+f_comma:      db(LIT_COMMA, 0)
+f_lbrack:     db(LIT_LBRACK, 0)
+f_rbrack:     db(LIT_RBRACK, 0)
+f_null:       db(LIT_NULL, 0)
+f_endrows:    db(LIT_ENDROWS, MB_NEWLINE, 0)
+lit_write:    db(LIT_WRITE, 0)
+lit_update:   db(LIT_UPDATE, 0)
+lit_delete:   db(LIT_DELETE, 0)
+
+lit_file:     db(LIT_FILEOPT, 0)
+lit_selftest: db(LIT_SELFTEST, 0)
+lit_help:     db(LIT_HELPOPT, 0)
+lit_rb:       db(LIT_RB, 0)
+hexchars:     db(LIT_HEX)
+
+lit_usage:       db(MSG_USAGE, MB_NEWLINE, 0)
+lit_openfail:    db(MSG_OPENFAIL, MB_NEWLINE, 0)
+lit_badmagic:    db(MSG_BADMAGIC, MB_NEWLINE, 0)
+lit_truncated:   db(MSG_TRUNCATED, MB_NEWLINE, 0)
+lit_checksum:    db(MSG_CHECKSUM, MB_NEWLINE, 0)
+lit_noschema:    db(MSG_NOSCHEMA, MB_NEWLINE, 0)
+lit_unsupported: db(MSG_UNSUPPORTED, MB_NEWLINE, 0)
+lit_st_ok:       db(MSG_ST_OK, MB_NEWLINE, 0)
+lit_st_fail:     db(MSG_ST_FAIL, MB_NEWLINE, 0)
+
+// CRC-32 standard vector "123456789" (9 bytes, not NUL-terminated).
+lit_crcvec:   db('123456789')
+
+// Hand-built 19-byte header used by --self-test.
+hdr_test:
+    dd(1700000000)
+    db(MB_EV_FORMAT_DESC)
+    dd(1)
+    dd(119)
+    dd(123)
+    dw(0)
+
+format_segment_end(image, ".rodata")
+
+// ==========================================================================
+// [4] SchemaRegistry + parser state. All state is in .bss because libc calls
+// clobber the caller-saved registers; nothing survives a call in a register.
+// ==========================================================================
+format_segment_begin(image, ".bss")
+
+inbuf:            rb(MB_INBUF_CAP)
+tmp:              rb(MB_TMP_CAP)
+
+argc_g:           rq(1)
+argv_g:           rq(1)
+path:             rq(1)
+fp:               rq(1)
+inlen:            rq(1)
+pos:              rq(1)
+ev_size:          rq(1)
+etype:            rq(1)
+stamps:           rq(1)
+body:             rq(1)
+blen:             rq(1)
+cur:              rq(1)
+brem:             rq(1)
+calccrc:          rd(1)
+
+// --- SchemaRegistry: one table entry (matches the controlled subset) ---
+schema_ok:        rq(1)
+schema_tid:       rq(1)
+schema_db:        rq(1)
+schema_dblen:     rq(1)
+schema_tbl:       rq(1)
+schema_tbllen:    rq(1)
+schema_cc:        rq(1)
+schema_nullable:  rq(1)
+schema_types:     rb(MB_MAX_COLS)
+schema_vlen:      rb(MB_MAX_COLS)
+
+// --- per-handler scratch (named, like C locals in a file-scope struct) ---
+f_bv:             rq(1)
+f_alg:            rq(1)
+svptr:            rq(1)
+svlen:            rq(1)
+g_sidptr:         rq(1)
+g_gno:            rq(1)
+q_dbl:            rq(1)
+q_svl:            rq(1)
+q_dbp:            rq(1)
+q_ql:             rq(1)
+q_qp:             rq(1)
+rq_len:           rq(1)
+rq_ptr:           rq(1)
+t_tid:            rq(1)
+t_dbl:            rq(1)
+t_dbp:            rq(1)
+t_tbl:            rq(1)
+t_tbp:            rq(1)
+t_cc:             rq(1)
+t_i:              rq(1)
+t_mdlen:          rq(1)
+t_mdstart:        rq(1)
+t_nb:             rq(1)
+t_nullbm:         rq(1)
+t_nullable:       rq(1)
+t_lb:             rb(1)
+r_tid:            rq(1)
+r_cc:             rq(1)
+r_bm:             rq(1)
+r_present:        rq(1)
+r_nbs:            rq(1)
+r_nullbm:         rq(1)
+r_slen:           rq(1)
+typename:         rq(1)
+
+format_segment_end(image, ".bss")
+
+// ==========================================================================
+// [2]/[3] Leaf helpers (never call libc, so stack alignment is irrelevant).
+// One shared little-endian loop for every read -- a function, not a macro.
+// ==========================================================================
+format_segment_begin(image, ".text")
+
+// rdi = ptr, rsi = n -> rax = little-endian value (n <= 8).
+le_n:
+    xor rax, rax
+    mov rcx, rsi
+le_n_loop:
+    test rcx, rcx
+    jz le_n_done
+    dec rcx
+    shl rax, 8
+    movzx r8d, byte [rdi + rcx]
+    or rax, r8
+    jmp le_n_loop
+le_n_done:
+    ret
+
+// rdi = s1, rsi = s2 -> rax = 0 if equal, else 1.
+strcmp_:
+strcmp_loop:
+    mov al, [rdi]
+    mov dl, [rsi]
+    cmp al, dl
+    jne strcmp_diff
+    test al, al
+    jz strcmp_equal
+    inc rdi
+    inc rsi
+    jmp strcmp_loop
+strcmp_diff:
+    mov eax, 1
+    ret
+strcmp_equal:
+    xor eax, eax
+    ret
+
+// rdi = ptr, rsi = len -> eax = CRC-32 (IEEE 802.3 / zlib).
+crc32:
+    mov eax, 0xFFFFFFFF
+    xor rcx, rcx
+crc_outer:
+    cmp rcx, rsi
+    jae crc_done
+    xor edx, edx
+    mov dl, [rdi + rcx]
+    xor eax, edx
+    xor r8, r8
+crc_inner:
+    cmp r8, 8
+    jae crc_next
+    mov r9d, eax
+    and r9d, 1
+    neg r9d
+    and r9d, MB_CRC32_POLY
+    shr eax, 1
+    xor eax, r9d
+    inc r8
+    jmp crc_inner
+crc_next:
+    inc rcx
+    jmp crc_outer
+crc_done:
+    not eax
+    ret
+
+// rsi = n -> rax = value; advances [cur], decrements [brem].
+take_le:
+    mov rdi, [rel cur]
+    call le_n
+    add qword [rel cur], rsi
+    sub qword [rel brem], rsi
+    ret
+
+// rsi = n; advances [cur], decrements [brem].
+skip_bytes:
+    add qword [rel cur], rsi
+    sub qword [rel brem], rsi
+    ret
+
+// -> rax = length-encoded integer; advances [cur], decrements [brem].
+lenenc:
+    mov rdi, [rel cur]
+    movzx rax, byte [rdi]
+    inc qword [rel cur]
+    dec qword [rel brem]
+    cmp al, 0xFB
+    jb lenenc_done
+    je lenenc_zero
+    cmp al, 0xFC
+    je lenenc_two
+    cmp al, 0xFD
+    je lenenc_three
+    cmp al, 0xFE
+    je lenenc_eight
+    xor eax, eax
+    ret
+lenenc_zero:
+    xor eax, eax
+    ret
+lenenc_two:
+    mov rsi, 2
+    call take_le
+    ret
+lenenc_three:
+    mov rsi, 3
+    call take_le
+    ret
+lenenc_eight:
+    mov rsi, 8
+    call take_le
+    ret
+lenenc_done:
+    ret
+
+// ==========================================================================
+// [8] CLI entry. SysV AMD64 ABI: rdi=argc, rsi=argv.
+// libc calls happen only from main's 16-byte-aligned frame.
+// ==========================================================================
+main:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rel argc_g], rdi
+    mov [rel argv_g], rsi
+
+    // ---- argument scan ----
+    mov r12, [rel argv_g]
+    mov r13, 1
+arg_loop:
+    cmp r13, [rel argc_g]
+    jae arg_done
+    mov rdi, [r12 + r13 * 8]
+    lea rsi, [rel lit_file]
+    call strcmp_
+    test rax, rax
+    jnz arg_not_file
+    inc r13
+    mov rax, [r12 + r13 * 8]
+    mov [rel path], rax
+    jmp arg_next
+arg_not_file:
+    mov rdi, [r12 + r13 * 8]
+    lea rsi, [rel lit_selftest]
+    call strcmp_
+    test rax, rax
+    jnz arg_not_selftest
+    jmp selftest
+arg_not_selftest:
+    mov rdi, [r12 + r13 * 8]
+    lea rsi, [rel lit_help]
+    call strcmp_
+    test rax, rax
+    jnz arg_next
+    PLIT lit_usage
+    mov rdi, 0
+    call exit_plt
+arg_next:
+    inc r13
+    jmp arg_loop
+arg_done:
+    cmp qword [rel path], 0
+    jne open_file
+    PLIT lit_usage
+    mov rdi, 2
+    call exit_plt
+
+    // ---- read whole file into .bss ----
+open_file:
+    mov rdi, [rel path]
+    lea rsi, [rel lit_rb]
+    call fopen_plt
+    test rax, rax
+    jz open_fail
+    mov [rel fp], rax
+    mov rdi, rax
+    xor esi, esi
+    mov edx, 2                         // SEEK_END
+    call fseek_plt
+    mov rdi, [rel fp]
+    call ftell_plt
+    mov [rel inlen], rax
+    mov rdi, [rel fp]
+    xor esi, esi
+    xor edx, edx                       // SEEK_SET
+    call fseek_plt
+    lea rdi, [rel inbuf]
+    mov esi, 1
+    mov rdx, [rel inlen]
+    mov rcx, [rel fp]
+    call fread_plt
+    mov rdi, [rel fp]
+    call fclose_plt
+
+    cmp dword [rel inbuf], 0x6E6962FE
+    jne bad_magic
+    mov qword [rel pos], MB_MAGIC_SIZE
+
+// ==========================================================================
+// [6] EventParser: framing + CRC32 verification + dispatch.
+// ==========================================================================
+ev_loop:
+    mov rax, [rel pos]
+    cmp rax, [rel inlen]
+    jae done_ok
+    lea r12, [rel inbuf]
+    add r12, [rel pos]                 // r12 = event base
+
+    lea rdi, [r12 + 9]
+    mov rsi, 4
+    call le_n
+    mov [rel ev_size], rax
+    cmp qword [rel ev_size], MB_MIN_EVENT_SIZE
+    jb truncated
+    mov rax, [rel pos]
+    add rax, [rel ev_size]
+    cmp rax, [rel inlen]
+    ja truncated
+
+    // CRC32 over header+body (event_size - 4 bytes).
+    mov rdi, r12
+    mov rsi, [rel ev_size]
+    sub rsi, MB_CRC_SIZE
+    call crc32
+    mov dword [rel calccrc], eax
+    mov rdi, r12
+    add rdi, [rel ev_size]
+    sub rdi, MB_CRC_SIZE
+    mov rsi, MB_CRC_SIZE
+    call le_n
+    mov r9d, dword [rel calccrc]
+    cmp r9d, eax
+    jne checksum_err
+
+    // header fields
+    movzx rax, byte [r12 + 4]
+    mov [rel etype], rax
+    mov rdi, r12
+    mov rsi, 4
+    call le_n
+    mov [rel stamps], rax
+
+    // body window
+    lea rax, [r12 + MB_HEADER_SIZE]
+    mov [rel body], rax
+    mov [rel cur], rax
+    mov rax, [rel ev_size]
+    sub rax, MB_MIN_EVENT_SIZE
+    mov [rel blen], rax
+    mov [rel brem], rax
+
+    // ---- dispatch on event_type (C switch equivalent) ----
+    mov rax, [rel etype]
+    cmp rax, MB_EV_FORMAT_DESC
+    je h_fde
+    cmp rax, MB_EV_GTID
+    je h_gtid
+    cmp rax, MB_EV_QUERY
+    je h_query
+    cmp rax, MB_EV_ROWS_QUERY
+    je h_rowsquery
+    cmp rax, MB_EV_TABLE_MAP
+    je h_tmap
+    cmp rax, MB_EV_WRITE_ROWS
+    je h_rows
+    cmp rax, MB_EV_UPDATE_ROWS
+    je h_rows
+    cmp rax, MB_EV_DELETE_ROWS
+    je h_rows
+    cmp rax, MB_EV_XID
+    je h_xid
+    cmp rax, MB_EV_ROTATE
+    je h_rotate
+    jmp h_unknown
+
+// ---- FORMAT_DESCRIPTION_EVENT (15) ----
+h_fde:
+    mov rsi, 2
+    call take_le
+    mov [rel f_bv], rax
+    mov rax, [rel cur]
+    mov [rel svptr], rax
+    xor rcx, rcx
+fde_svscan:
+    cmp rcx, MB_SERVER_VERSION_LEN
+    jae fde_svscan_done
+    mov rdi, [rel svptr]
+    cmp byte [rdi + rcx], 0
+    je fde_svscan_done
+    inc rcx
+    jmp fde_svscan
+fde_svscan_done:
+    mov [rel svlen], rcx
+    mov rsi, MB_SERVER_VERSION_LEN
+    call skip_bytes
+    mov rdi, [rel body]
+    add rdi, [rel blen]
+    sub rdi, 1
+    movzx rax, byte [rdi]
+    mov [rel f_alg], rax
+
+    lea rdi, [rel f_fde]
+    mov rsi, [rel stamps]
+    mov rdx, [rel f_bv]
+    mov rcx, [rel svlen]
+    mov r8, [rel svptr]
+    mov r9, [rel f_alg]
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+// ---- GTID_LOG_EVENT (33) ----
+h_gtid:
+    mov rsi, 1
+    call take_le                       // flags
+    mov rax, [rel cur]
+    mov [rel g_sidptr], rax
+    mov rsi, 16
+    call skip_bytes
+    // 16 sid bytes -> 32 lowercase hex chars in tmp
+    mov rdi, [rel g_sidptr]
+    lea r8, [rel tmp]
+    lea r11, [rel hexchars]
+    xor rcx, rcx
+gtid_hexloop:
+    cmp rcx, 16
+    jae gtid_hexdone
+    movzx rax, byte [rdi + rcx]
+    mov r9, rax
+    shr r9, 4
+    movzx r10d, byte [r11 + r9]
+    mov [r8 + rcx * 2], r10b
+    and rax, 15
+    movzx r10d, byte [r11 + rax]
+    mov [r8 + rcx * 2 + 1], r10b
+    inc rcx
+    jmp gtid_hexloop
+gtid_hexdone:
+    mov rsi, 8
+    call take_le
+    mov [rel g_gno], rax
+    lea rdi, [rel f_gtid]
+    mov rsi, [rel stamps]
+    mov rdx, [rel g_gno]
+    mov rcx, 32
+    lea r8, [rel tmp]
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+// ---- QUERY_EVENT (2) ----
+h_query:
+    mov rsi, 4
+    call take_le                       // thread_id
+    mov rsi, 4
+    call take_le                       // exec_time
+    mov rsi, 1
+    call take_le
+    mov [rel q_dbl], rax
+    mov rsi, 2
+    call take_le                       // error_code
+    mov rsi, 2
+    call take_le
+    mov [rel q_svl], rax
+    mov rsi, [rel q_svl]
+    call skip_bytes                    // status_vars
+    mov rax, [rel cur]
+    mov [rel q_dbp], rax
+    mov rsi, [rel q_dbl]
+    call skip_bytes                    // db
+    mov rsi, 1
+    call take_le                       // trailing NUL
+    mov rax, [rel cur]
+    mov [rel q_qp], rax
+    mov rax, [rel brem]
+    mov [rel q_ql], rax
+
+    lea rdi, [rel f_query]
+    mov rsi, [rel stamps]
+    mov rdx, [rel q_dbl]
+    mov rcx, [rel q_dbp]
+    mov r8, [rel q_ql]
+    mov r9, [rel q_qp]
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+// ---- ROWS_QUERY_LOG_EVENT (29) ----
+h_rowsquery:
+    call lenenc
+    mov [rel rq_len], rax
+    mov rax, [rel cur]
+    mov [rel rq_ptr], rax
+    mov rsi, [rel rq_len]
+    call skip_bytes
+    lea rdi, [rel f_rowsquery]
+    mov rsi, [rel stamps]
+    mov rdx, [rel rq_len]
+    mov rcx, [rel rq_ptr]
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+// ---- TABLE_MAP_EVENT (19) : [4] SchemaRegistry ----
+h_tmap:
+    mov rsi, 6
+    call take_le
+    mov [rel t_tid], rax
+    mov rsi, 2
+    call take_le                       // flags
+    mov rsi, 1
+    call take_le
+    mov [rel t_dbl], rax
+    mov rax, [rel cur]
+    mov [rel t_dbp], rax
+    mov rsi, [rel t_dbl]
+    call skip_bytes
+    mov rsi, 1
+    call take_le                       // NUL
+    mov rsi, 1
+    call take_le
+    mov [rel t_tbl], rax
+    mov rax, [rel cur]
+    mov [rel t_tbp], rax
+    mov rsi, [rel t_tbl]
+    call skip_bytes
+    mov rsi, 1
+    call take_le                       // NUL
+    call lenenc
+    mov [rel t_cc], rax
+
+    // column_types[]
+    mov qword [rel t_i], 0
+tmap_typeloop:
+    mov rax, [rel t_i]
+    cmp rax, [rel t_cc]
+    jae tmap_typedone
+    mov rsi, 1
+    call take_le
+    mov rcx, [rel t_i]
+    lea r11, [rel schema_types]
+    mov [r11 + rcx], al
+    inc qword [rel t_i]
+    jmp tmap_typeloop
+tmap_typedone:
+    call lenenc
+    mov [rel t_mdlen], rax
+    mov rax, [rel cur]
+    mov [rel t_mdstart], rax
+
+    // metadata: VARCHAR contributes a 2-byte maxlen
+    mov qword [rel t_i], 0
+tmap_mdloop:
+    mov rax, [rel t_i]
+    cmp rax, [rel t_cc]
+    jae tmap_mddone
+    mov rcx, [rel t_i]
+    lea r11, [rel schema_types]
+    movzx rax, byte [r11 + rcx]
+    cmp al, MB_TYPE_VARCHAR
+    jne tmap_md_skip
+    mov rsi, 2
+    call take_le
+    cmp rax, 255
+    ja tmap_md_two
+    mov byte [rel t_lb], 1
+    jmp tmap_md_set
+tmap_md_two:
+    mov byte [rel t_lb], 2
+tmap_md_set:
+    mov rcx, [rel t_i]
+    mov al, byte [rel t_lb]
+    lea r11, [rel schema_vlen]
+    mov [r11 + rcx], al
+    jmp tmap_md_next
+tmap_md_skip:
+    mov rcx, [rel t_i]
+    lea r11, [rel schema_vlen]
+    mov byte [r11 + rcx], 0
+tmap_md_next:
+    inc qword [rel t_i]
+    jmp tmap_mdloop
+tmap_mddone:
+    // cur = mdstart + mdlen ; recompute brem
+    mov rax, [rel t_mdstart]
+    add rax, [rel t_mdlen]
+    mov [rel cur], rax
+    mov rax, [rel body]
+    add rax, [rel blen]
+    sub rax, [rel cur]
+    mov [rel brem], rax
+
+    // null_bitmap -> nullable_count
+    mov rax, [rel t_cc]
+    add rax, 7
+    shr rax, 3
+    mov [rel t_nb], rax
+    mov rsi, rax
+    call take_le
+    mov [rel t_nullbm], rax
+    mov qword [rel t_nullable], 0
+    mov qword [rel t_i], 0
+tmap_popc:
+    mov rax, [rel t_i]
+    cmp rax, [rel t_cc]
+    jae tmap_popdone
+    mov rcx, [rel t_i]
+    mov rax, [rel t_nullbm]
+    bt rax, rcx
+    jnc tmap_popnext
+    inc qword [rel t_nullable]
+tmap_popnext:
+    inc qword [rel t_i]
+    jmp tmap_popc
+tmap_popdone:
+    // publish schema
+    mov rax, [rel t_tid]
+    mov [rel schema_tid], rax
+    mov rax, [rel t_dbl]
+    mov [rel schema_dblen], rax
+    mov rax, [rel t_dbp]
+    mov [rel schema_db], rax
+    mov rax, [rel t_tbl]
+    mov [rel schema_tbllen], rax
+    mov rax, [rel t_tbp]
+    mov [rel schema_tbl], rax
+    mov rax, [rel t_cc]
+    mov [rel schema_cc], rax
+    mov rax, [rel t_nullable]
+    mov [rel schema_nullable], rax
+    mov qword [rel schema_ok], 1
+
+    lea rdi, [rel f_tmap1]
+    mov rsi, [rel stamps]
+    mov rdx, [rel t_tid]
+    mov rcx, [rel t_dbl]
+    mov r8, [rel t_dbp]
+    xor eax, eax
+    call printf_plt
+    lea rdi, [rel f_tmap2]
+    mov rsi, [rel t_tbl]
+    mov rdx, [rel t_tbp]
+    mov rcx, [rel t_cc]
+    xor eax, eax
+    call printf_plt
+
+    mov qword [rel t_i], 0
+tmap_arr:
+    mov rax, [rel t_i]
+    cmp rax, [rel t_cc]
+    jae tmap_arrdone
+    cmp qword [rel t_i], 0
+    je tmap_arr_value
+    PLIT f_comma
+tmap_arr_value:
+    lea rdi, [rel f_num]
+    mov rcx, [rel t_i]
+    lea r11, [rel schema_types]
+    xor rsi, rsi
+    mov sil, byte [r11 + rcx]
+    xor eax, eax
+    call printf_plt
+    inc qword [rel t_i]
+    jmp tmap_arr
+tmap_arrdone:
+    PLIT f_endrows
+    jmp next_event
+
+// ---- [5] RowDecoder: WRITE/UPDATE/DELETE_ROWS_EVENT_V2 (30/31/32) ----
+h_rows:
+    mov rax, [rel etype]
+    cmp rax, MB_EV_WRITE_ROWS
+    je rows_name_w
+    cmp rax, MB_EV_UPDATE_ROWS
+    je rows_name_u
+    lea rax, [rel lit_delete]
+    jmp rows_name_done
+rows_name_w:
+    lea rax, [rel lit_write]
+    jmp rows_name_done
+rows_name_u:
+    lea rax, [rel lit_update]
+rows_name_done:
+    mov [rel typename], rax
+
+    mov rsi, 6
+    call take_le
+    mov [rel r_tid], rax
+    mov rsi, 2
+    call take_le                       // flags
+    mov rsi, 2
+    call take_le                       // extra_data_len (includes itself)
+    sub rax, 2
+    mov rsi, rax
+    call skip_bytes                    // extra_data
+    call lenenc
+    mov [rel r_cc], rax
+    mov rax, [rel r_cc]
+    add rax, 7
+    shr rax, 3
+    mov [rel r_bm], rax
+    mov rsi, rax
+    call take_le                       // columns_present bitmap1
+    mov [rel r_present], rax
+    mov rax, [rel etype]
+    cmp rax, MB_EV_UPDATE_ROWS
+    jne rows_no_bm2
+    mov rsi, [rel r_bm]
+    call take_le                       // bitmap2 (equal in this subset)
+rows_no_bm2:
+    cmp qword [rel schema_ok], 0
+    je no_schema
+    mov rax, [rel r_tid]
+    cmp rax, [rel schema_tid]
+    jne no_schema
+    mov rax, [rel schema_nullable]
+    add rax, 7
+    shr rax, 3
+    mov [rel r_nbs], rax
+
+    lea rdi, [rel f_rows1]
+    mov rsi, [rel typename]
+    mov rdx, [rel stamps]
+    mov rcx, [rel r_tid]
+    mov r8, [rel schema_dblen]
+    mov r9, [rel schema_db]
+    xor eax, eax
+    call printf_plt
+    lea rdi, [rel f_rows2]
+    mov rsi, [rel schema_tbllen]
+    mov rdx, [rel schema_tbl]
+    xor eax, eax
+    call printf_plt
+
+rows_rowloop:
+    cmp qword [rel brem], 0
+    je rows_rowdone
+    mov rsi, [rel r_nbs]
+    call take_le                       // null_bitmap
+    mov [rel r_nullbm], rax
+    PLIT f_lbrack
+    xor r14, r14                       // column index i (callee-saved)
+    xor r15, r15                       // 0 = no comma yet, 1 = comma next
+rows_collow:
+    mov rax, [rel schema_cc]
+    cmp r14, rax
+    jae rows_coldone
+    mov rax, [rel r_present]
+    bt rax, r14
+    jnc rows_colnext
+    cmp r15, 0
+    je rows_nocomma
+    PLIT f_comma
+rows_nocomma:
+    mov r15, 1
+    mov rax, [rel r_nullbm]
+    bt rax, r14
+    jc rows_nullval
+    lea r11, [rel schema_types]
+    movzx rax, byte [r11 + r14]
+    cmp al, MB_TYPE_LONGLONG
+    je rows_i64
+    cmp al, MB_TYPE_LONG
+    je rows_i32
+    cmp al, MB_TYPE_VARCHAR
+    je rows_varchar
+    jmp unsupported
+rows_i64:
+    mov rsi, 8
+    call take_le
+    mov rsi, rax
+    lea rdi, [rel f_num]
+    xor eax, eax
+    call printf_plt
+    jmp rows_colnext
+rows_i32:
+    mov rsi, 4
+    call take_le
+    mov rsi, rax
+    lea rdi, [rel f_num]
+    xor eax, eax
+    call printf_plt
+    jmp rows_colnext
+rows_varchar:
+    lea r11, [rel schema_vlen]
+    movzx rsi, byte [r11 + r14]
+    test rsi, rsi
+    jnz rows_vlb_ok
+    mov rsi, 1
+rows_vlb_ok:
+    call take_le                       // slen
+    mov [rel r_slen], rax
+    mov rdx, [rel cur]                // string pointer for printf
+    mov r8, [rel r_slen]
+    add qword [rel cur], r8
+    sub qword [rel brem], r8
+    lea rdi, [rel f_qstr]
+    mov rsi, [rel r_slen]
+    xor eax, eax
+    call printf_plt
+    jmp rows_colnext
+rows_nullval:
+    PLIT f_null
+rows_colnext:
+    inc r14
+    jmp rows_collow
+rows_coldone:
+    PLIT f_rbrack
+    cmp qword [rel brem], 0
+    je rows_rowdone
+    PLIT f_comma
+    jmp rows_rowloop
+rows_rowdone:
+    PLIT f_endrows
+    jmp next_event
+
+// ---- XID_EVENT (16) ----
+h_xid:
+    mov rsi, 8
+    call take_le
+    lea rdi, [rel f_xid]
+    mov rsi, [rel stamps]
+    mov rdx, rax
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+// ---- ROTATE_EVENT (4) ----
+h_rotate:
+    mov rsi, 8
+    call take_le
+    mov [rel r_slen], rax              // reuse as position
+    mov r8, [rel cur]
+    mov rcx, [rel brem]
+    lea rdi, [rel f_rotate]
+    mov rsi, [rel stamps]
+    mov rdx, [rel r_slen]
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+// ---- UNKNOWN: safe skip, stable one-line record ----
+h_unknown:
+    lea rdi, [rel f_unknown]
+    mov rsi, [rel stamps]
+    mov rdx, [rel etype]
+    mov rcx, [rel ev_size]
+    xor eax, eax
+    call printf_plt
+    jmp next_event
+
+next_event:
+    mov rax, [rel pos]
+    add rax, [rel ev_size]
+    mov [rel pos], rax
+    jmp ev_loop
+
+// ==========================================================================
+// --self-test : CRC-32 standard vector + 19-byte header decoding.
+// ==========================================================================
+selftest:
+    lea rdi, [rel lit_crcvec]
+    mov rsi, 9
+    call crc32
+    cmp eax, MB_CRC32_VECTOR
+    jne selftest_fail
+    lea rdi, [rel hdr_test]
+    mov rsi, 4
+    call le_n
+    cmp rax, 1700000000
+    jne selftest_fail
+    movzx rax, byte [rel hdr_test + 4]
+    cmp al, MB_EV_FORMAT_DESC
+    jne selftest_fail
+    lea rdi, [rel hdr_test + 9]
+    mov rsi, 4
+    call le_n
+    cmp rax, 119
+    jne selftest_fail
+    PLIT lit_st_ok
+    mov rdi, 0
+    call exit_plt
+selftest_fail:
+    PLIT lit_st_fail
+    mov rdi, 1
+    call exit_plt
+
+// ---- error / success exits ----
+open_fail:
+    PLIT lit_openfail
+    mov rdi, 2
+    call exit_plt
+bad_magic:
+    PLIT lit_badmagic
+    mov rdi, 1
+    call exit_plt
+truncated:
+    PLIT lit_truncated
+    mov rdi, 1
+    call exit_plt
+checksum_err:
+    PLIT lit_checksum
+    mov rdi, 1
+    call exit_plt
+no_schema:
+    PLIT lit_noschema
+    mov rdi, 1
+    call exit_plt
+unsupported:
+    PLIT lit_unsupported
+    mov rdi, 1
+    call exit_plt
+done_ok:
+    mov rdi, 0
+    call exit_plt
+
+format_segment_end(image, ".text")
+
+format_entry_mut(image, main)
+format_finish(image)

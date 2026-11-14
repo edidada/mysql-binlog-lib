@@ -31,7 +31,7 @@
 | zig | `zig build test`（`test` 块；golden 由 CI diff 保证） | Zig 0.13.0 |
 | erlang | `eunit:test/2`（含 golden） | OTP `erlc` / `erl` |
 | python | `python3 -m unittest discover`（含 golden） | Python 3 |
-| asm | `./mysqlbinlog-asm --self-test`（CRC 向量 + header 字段） | nasm + gcc -no-pie |
+| asm | `./mysqlbinlog-asm --self-test`（CRC 向量 + header 字段） | XIRASM 0.3.5 |
 
 Rust / Go / Java / C# / Erlang / Python 的单测内部还各做一次 golden 比对；
 C / C++ / Zig / asm 的端到端一致性由 CI 的 `diff -u expected.jsonl out.jsonl` 保证

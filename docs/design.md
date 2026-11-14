@@ -268,7 +268,7 @@ zig/     build.zig, src/{parser.zig,main.zig}         (Zig 0.13.0, zig build tes
 erlang/  src/{mysqlbinlog.erl,mysqlbinlog_cli.erl}, test/mysqlbinlog_tests.erl,
          mysqlbinlog-erl (escript)                    (OTP erlc + EUnit)
 python/  mysqlbinlog.py, mysqlbinlog_cli.py, test_parser.py (标准库 unittest)
-asm/     main.asm                                    (x86-64 NASM + gcc -no-pie)
+asm/     main.xir                                    (XIRASM 0.3.5, x86-64 ELF64)
 ```
 
 | 语言 | CRC32 实现 | 单测载体 | 备注 |
@@ -279,7 +279,7 @@ asm/     main.asm                                    (x86-64 NASM + gcc -no-pie)
 
 - 依赖策略：**全部零第三方库依赖**，避免 CI 拉取网络依赖导致不稳定。工具链本身由 CI 的 setup action / apt 安装（见 ops-sop.md §1），不算库依赖。
 - Python 用 `json.dumps(..., separators=(',',':'))` + 保序 dict 生成 canonical JSONL；其余语言手写 serializer，保证键序一致。
-- 汇编版 (xirasm) 用 libc `printf` 输出，字符串依赖受控子集「纯 ASCII 无特殊字符」的约束（`%.*s` 不做 JSON 转义）；其余九语言实现完整转义。
+- 汇编版 (xirasm) 由 `format.inc` 直接生成 ELF64 可执行文件，libc 调用走自动生成的 PLT 导入（`*_plt` 标签），用 `printf` 输出；字符串依赖受控子集「纯 ASCII 无特殊字符」的约束（`%.*s` 不做 JSON 转义）；其余九语言实现完整转义。源码用 XIRASM 的编译期语言（`const`/`struct`/`packed struct`/`assert`/`macro`/`format_*`）组织为与 C 版一致的 ByteReader / EventParser / SchemaRegistry / RowDecoder / Serializer 分层；运行时解析逻辑仍是手写 x86-64 指令。
 - 构建与验证统一由 `.github/workflows/ci.yml` 完成；**本地不编译**（见 ops-sop.md §2）。
 
 ## 8. 与后续阶段的边界

@@ -35,7 +35,7 @@ csharp/  .NET 8     (无 NuGet 包)        -> mysqlbinlog-cs
 zig/     Zig 0.13   (零依赖)             -> mysqlbinlog-zig
 erlang/  OTP        (erlc + EUnit)       -> mysqlbinlog-erl
 python/  Python 3   (标准库)             -> mysqlbinlog-py
-asm/     x86-64 NASM + gcc -no-pie       -> mysqlbinlog-asm   (xirasm)
+asm/     XIRASM 0.3.5 (x86-64 ELF64)    -> mysqlbinlog-asm   (xirasm)
 ```
 
 ## 语言与工具链（均在 CI 安装/使用，零第三方库依赖）
@@ -51,7 +51,7 @@ asm/     x86-64 NASM + gcc -no-pie       -> mysqlbinlog-asm   (xirasm)
 | Zig | `zig build` | `zig build test` | `mysqlbinlog-zig` |
 | Erlang | `erlc` | EUnit | `escript mysqlbinlog-erl` |
 | Python | `py_compile` | `unittest` | `mysqlbinlog_cli.py` |
-| x86-64 汇编 | `nasm -felf64` + `gcc -no-pie` | `--self-test` | `mysqlbinlog-asm` |
+| x86-64 汇编 | XIRASM 0.3.5（`format.inc` 直出 ELF64 + libc PLT 导入，零链接器） | `--self-test` | `mysqlbinlog-asm` |
 
 ## 统一输出
 
