@@ -31,7 +31,8 @@
 
 import("format/format.inc")
 
-x86.use64()
+// The CLI passes `--isa x86-64`; the tutorial's ELF examples rely on that
+// starting target rather than calling x86.use64() here.
 
 // ==========================================================================
 // [1] Protocol constants (docs/design.md sections 2-3). All C-like names.

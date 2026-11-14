@@ -182,6 +182,8 @@ jobs:
         if: matrix.lang == 'asm'
         run: |
           set -e
+          echo "--- probe (tutorial minimal) ---"
+          .xirasm/xirasm asm/probe.xir --isa x86-64 -o asm/probe.bin || true
           .xirasm/xirasm asm/main.xir --isa x86-64 -o asm/mysqlbinlog-asm --listing asm/main.lst
           echo "--- listing head ---"
           sed -n '1,40p' asm/main.lst || true
