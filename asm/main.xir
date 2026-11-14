@@ -147,7 +147,7 @@ format_begin(image)
 //
 // printf a plain literal (no '%' inside) to stdout. eax=0 selects no SSE args.
 // ==========================================================================
-macro PLIT label {
+macro PLIT(label) {
     lea rdi, [rel label]
     xor eax, eax
     call printf_plt
