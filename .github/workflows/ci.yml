@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.lang }} — build / test / golden
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [c, cpp, rust, go]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Setup Rust
+        if: matrix.lang == 'rust'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Toolchain versions
+        run: |
+          cmake --version | head -1
+          gcc --version | head -1
+          python3 --version
+          if [ "${{ matrix.lang }}" = "go" ]; then go version; fi
+          if [ "${{ matrix.lang }}" = "rust" ]; then rustc --version; cargo --version; fi
+
+      - name: Generate & verify fixtures (no drift)
+        run: |
+          set -e
+          python3 fixtures/gen_fixture.py
+          git diff --exit-code -- fixtures/demo.bin fixtures/expected.jsonl
+
+      - name: Build, unit test, run (C)
+        if: matrix.lang == 'c'
+        run: |
+          set -e
+          cmake -S c -B c/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build c/build --parallel
+          ctest --test-dir c/build --output-on-failure
+          ./c/build/mysqlbinlog-c --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (C++)
+        if: matrix.lang == 'cpp'
+        run: |
+          set -e
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build --parallel
+          ctest --test-dir cpp/build --output-on-failure
+          ./cpp/build/mysqlbinlog-cpp --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (Rust)
+        if: matrix.lang == 'rust'
+        run: |
+          set -e
+          cargo build --release --manifest-path rust/Cargo.toml
+          cargo test --manifest-path rust/Cargo.toml
+          ./rust/target/release/mysqlbinlog-rust --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (Go)
+        if: matrix.lang == 'go'
+        run: |
+          set -e
+          cd go
+          go build -o ../mysqlbinlog-go ./cmd/mysqlbinlog
+          go test ./...
+          cd ..
+          ./mysqlbinlog-go --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Golden diff (must match expected.jsonl byte-for-byte)
+        run: |
+          set -e
+          test -s out.jsonl
+          diff -u fixtures/expected.jsonl out.jsonl
+          echo "OK: ${{ matrix.lang }} build + unit tests + golden output all passed"

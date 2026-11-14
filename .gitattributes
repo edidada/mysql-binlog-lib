@@ -1,0 +1,12 @@
+# Golden fixtures must be byte-exact across platforms / CI.
+fixtures/demo.bin binary
+fixtures/expected.jsonl text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.rs text eol=lf
+*.go text eol=lf
+*.py text eol=lf

@@ -1,0 +1,11 @@
+{"type":"FORMAT_DESCRIPTION_EVENT","timestamp":1700000000,"binlog_version":4,"server_version":"8.0.36","checksum_alg":1}
+{"type":"UNKNOWN","timestamp":1700000001,"type_id":99,"event_size":26}
+{"type":"GTID_LOG_EVENT","timestamp":1700000002,"gno":42,"sid":"000102030405060708090a0b0c0d0e0f"}
+{"type":"QUERY_EVENT","timestamp":1700000003,"db":"financial_db","query":"BEGIN"}
+{"type":"ROWS_QUERY_LOG_EVENT","timestamp":1700000004,"query":"INSERT INTO transactions"}
+{"type":"TABLE_MAP_EVENT","timestamp":1700000005,"table_id":108,"db":"financial_db","table":"transactions","column_count":3,"column_types":[8,3,15]}
+{"type":"WRITE_ROWS_EVENT_V2","timestamp":1700000006,"table_id":108,"db":"financial_db","table":"transactions","rows":[[1001,7,"insert"]]}
+{"type":"UPDATE_ROWS_EVENT_V2","timestamp":1700000007,"table_id":108,"db":"financial_db","table":"transactions","rows":[[1002,8,"before"],[1002,8,null]]}
+{"type":"DELETE_ROWS_EVENT_V2","timestamp":1700000008,"table_id":108,"db":"financial_db","table":"transactions","rows":[[1003,9,"delete"]]}
+{"type":"XID_EVENT","timestamp":1700000009,"xid":12345}
+{"type":"ROTATE_EVENT","timestamp":1700000010,"position":4,"next_file":"mysql-bin.000002"}

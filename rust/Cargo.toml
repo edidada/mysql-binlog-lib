@@ -1,0 +1,16 @@
+[package]
+name = "mysqlbinlog"
+version = "0.1.0"
+edition = "2021"
+description = "Offline MySQL binlog parser (Phase 1 baseline), zero dependencies"
+license = "MIT"
+
+[lib]
+name = "mysqlbinlog"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mysqlbinlog-rust"
+path = "src/main.rs"
+
+[dependencies]

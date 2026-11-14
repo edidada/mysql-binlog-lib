@@ -1,0 +1,35 @@
+# C / C++ build trees
+c/build/
+cpp/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+*.o
+*.obj
+*.a
+*.lib
+
+# Rust
+rust/target/
+
+# Go
+go/mysqlbinlog-go
+/mysqlbinlog-go
+
+# Local compiler outputs (should never be produced locally; guard anyway)
+/mysqlbinlog-c
+/mysqlbinlog-cpp
+/mysqlbinlog-rust
+*.exe
+
+# Python / editor / OS
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# NOTE: fixtures/demo.bin and fixtures/expected.jsonl are intentionally
+# committed and must NOT be ignored; CI verifies they are reproducible.
