@@ -9,6 +9,13 @@
 extern "C" {
 #endif
 
+/*
+ * Phase 1 offline parser (see docs/design.md). The public API and the
+ * canonical JSONL emitted by mb_parse_buffer are a cross-language contract:
+ * the other nine implementations and fixtures/expected.jsonl rely on them.
+ * Internals are layered as ByteReader / CRC32 / Serializer / SchemaRegistry /
+ * RowDecoder / EventParser inside src/mysqlbinlog.c.
+ */
 typedef enum {
     MB_OK = 0,
     MB_ERR_INVALID = -1,

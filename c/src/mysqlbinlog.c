@@ -1,48 +1,100 @@
+/*
+ * mysqlbinlog.c - offline MySQL binlog parser (Phase 1 controlled subset).
+ *
+ * Layered structure (mirrors docs/design.md section 4):
+ *
+ *   [1] ByteReader     bounds-checked little-endian primitives
+ *   [2] CRC-32         IEEE / zlib checksum
+ *   [3] Serializer     canonical JSONL builder (fixed key order, no spaces)
+ *   [4] SchemaRegistry table_id -> TableSchema
+ *   [5] RowDecoder     decode RowsEventV2 rows using a registered schema
+ *   [6] EventParser    frame/verify/dispatch events -> one JSONL line each
+ *   [7] Public API     mb_parse_header / mb_crc32 / mb_parse_buffer
+ *
+ * The public API in include/mysqlbinlog.h and the emitted JSONL are a
+ * contract with the other nine language implementations (fixtures/
+ * expected.jsonl). Do not change either without a cross-language update.
+ */
+
 #include "mysqlbinlog.h"
 
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-/* ------------------------------------------------------------------ */
-/* ByteReader: bounds-checked little-endian primitives                  */
-/* ------------------------------------------------------------------ */
+/* Protocol constants (docs/design.md section 2). */
+#define MB_HEADER_SIZE       19u
+#define MB_CRC_SIZE          4u
+#define MB_MAGIC_SIZE        4u
+#define MB_MAX_COLS          64
+#define MB_MAX_TABLES        64
+#define MB_MAX_EVENT_SIZE    (256u * 1024u * 1024u) /* defence against corrupt sizes */
+#define MB_LINE_CAP          16384                    /* max single JSONL line */
+
+/* Column type ids used by the controlled subset. */
+#define MB_TYPE_LONG         3
+#define MB_TYPE_LONGLONG     8
+#define MB_TYPE_VARCHAR      15
+
+/* Event type ids (docs/design.md section 3). */
+#define MB_EV_QUERY          2
+#define MB_EV_ROTATE         4
+#define MB_EV_FORMAT_DESC    15
+#define MB_EV_XID            16
+#define MB_EV_TABLE_MAP      19
+#define MB_EV_ROWS_QUERY     29
+#define MB_EV_WRITE_ROWS_V2  30
+#define MB_EV_UPDATE_ROWS_V2 31
+#define MB_EV_DELETE_ROWS_V2 32
+#define MB_EV_GTID           33
+
+/* ================================================================== */
+/* [1] ByteReader: every read is bounds-checked; r->error latches.      */
+/* ================================================================== */
 typedef struct {
     const uint8_t *p;
     size_t len;
     size_t pos;
-    int error; /* set on out-of-bounds read */
+    int error;
 } reader;
 
-static size_t rem(reader *r) { return r->pos <= r->len ? r->len - r->pos : 0; }
+static void rd_init(reader *r, const uint8_t *p, size_t len)
+{
+    r->p = p;
+    r->len = len;
+    r->pos = 0;
+    r->error = 0;
+}
 
-static uint64_t rd_le(reader *r, int n)
+static size_t rem(const reader *r)
+{
+    return r->pos <= r->len ? r->len - r->pos : 0;
+}
+
+/* Overflow-safe "pos + n <= len" test. */
+static int rd_can(const reader *r, size_t n)
+{
+    return !r->error && n <= r->len && r->pos <= r->len - n;
+}
+
+static uint64_t rd_le(reader *r, size_t n)
 {
     uint64_t v = 0;
-    int i;
-    if (n < 0 || n > 8 || r->pos + (size_t)n > r->len) {
+    size_t i;
+
+    if (n > 8 || !rd_can(r, n)) {
         r->error = 1;
         return 0;
     }
     for (i = 0; i < n; ++i)
-        v |= ((uint64_t)r->p[r->pos + (size_t)i]) << (8 * i);
-    r->pos += (size_t)n;
-    return v;
-}
-
-static uint64_t peek_le(const uint8_t *p, int n)
-{
-    uint64_t v = 0;
-    int i;
-    for (i = 0; i < n; ++i)
-        v |= ((uint64_t)p[i]) << (8 * i);
+        v |= ((uint64_t)r->p[r->pos + i]) << (8 * i);
+    r->pos += n;
     return v;
 }
 
 static void rd_raw(reader *r, size_t n, uint8_t *dst)
 {
-    if (r->pos + n > r->len) {
+    if (!rd_can(r, n)) {
         r->error = 1;
         if (dst) memset(dst, 0, n);
         return;
@@ -51,12 +103,15 @@ static void rd_raw(reader *r, size_t n, uint8_t *dst)
     r->pos += n;
 }
 
-/* Read exactly n bytes as a NUL-terminated C string (truncate if cap small,
-   but still advance the reader by n to stay aligned). */
+/* Read exactly n bytes as a NUL-terminated C string. The reader always
+   advances by n (alignment is preserved) even if the string is truncated
+   to fit cap. */
 static void rd_strn(reader *r, size_t n, char *dst, size_t cap)
 {
     size_t m;
-    if (r->pos + n > r->len) {
+
+    if (cap == 0) return;
+    if (!rd_can(r, n)) {
         r->error = 1;
         dst[0] = '\0';
         return;
@@ -67,9 +122,9 @@ static void rd_strn(reader *r, size_t n, char *dst, size_t cap)
     r->pos += n;
 }
 
-static void skip(reader *r, size_t n)
+static void rd_skip(reader *r, size_t n)
 {
-    if (r->pos + n > r->len) {
+    if (!rd_can(r, n)) {
         r->error = 1;
         r->pos = r->len;
     } else {
@@ -77,27 +132,31 @@ static void skip(reader *r, size_t n)
     }
 }
 
-static uint64_t rd_lenenc(reader *r, int *is_null)
+/* MySQL length-encoded integer. Returns MB_ERR_UNSUPPORTED via r->error
+   for the reserved 0xFF marker and for NULL (0xFB) where a length is
+   required. */
+static uint64_t rd_lenenc(reader *r)
 {
     uint8_t b;
-    *is_null = 0;
+
     b = (uint8_t)rd_le(r, 1);
     if (b < 0xFB) return b;
-    if (b == 0xFB) { *is_null = 1; return 0; }
     if (b == 0xFC) return rd_le(r, 2);
     if (b == 0xFD) return rd_le(r, 3);
     if (b == 0xFE) return rd_le(r, 8);
-    return 0; /* 0xFF is invalid */
+    r->error = 1; /* 0xFB (NULL) or 0xFF (reserved) is not a valid length */
+    return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* CRC-32 (IEEE / zlib)                                                  */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* [2] CRC-32 (IEEE 802.3 / zlib), public for unit tests.               */
+/* ================================================================== */
 uint32_t mb_crc32(const uint8_t *data, size_t size)
 {
     uint32_t crc = 0xFFFFFFFFu;
     size_t i;
     int k;
+
     for (i = 0; i < size; ++i) {
         crc ^= data[i];
         for (k = 0; k < 8; ++k) {
@@ -108,9 +167,18 @@ uint32_t mb_crc32(const uint8_t *data, size_t size)
     return ~crc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Canonical string builder (no spaces, fixed key order)                 */
-/* ------------------------------------------------------------------ */
+/* Little-endian peek over an already validated, CRC-sized region. */
+static uint32_t peek_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+/* ================================================================== */
+/* [3] Serializer: bounded canonical JSONL builder.                     */
+/* ================================================================== */
 typedef struct {
     char *p;
     size_t cap;
@@ -145,6 +213,7 @@ static void sb_printf(sb *b, const char *fmt, ...)
     va_list ap;
     int n;
     size_t avail;
+
     if (b->overflow) return;
     avail = b->cap - b->len;
     va_start(ap, fmt);
@@ -154,6 +223,7 @@ static void sb_printf(sb *b, const char *fmt, ...)
     b->len += (size_t)n;
 }
 
+/* Minimal JSON string escaping: quotes, backslash, control characters. */
 static void sb_json_str(sb *b, const char *s)
 {
     sb_putc(b, '"');
@@ -162,45 +232,44 @@ static void sb_json_str(sb *b, const char *s)
         switch (c) {
         case '"':  sb_puts(b, "\\\""); break;
         case '\\': sb_puts(b, "\\\\"); break;
-        case '\n': sb_puts(b, "\\n"); break;
-        case '\r': sb_puts(b, "\\r"); break;
-        case '\t': sb_puts(b, "\\t"); break;
+        case '\n': sb_puts(b, "\\n");  break;
+        case '\r': sb_puts(b, "\\r");  break;
+        case '\t': sb_puts(b, "\\t");  break;
         default:
-            if (c < 0x20) {
-                sb_printf(b, "\\u%04x", (unsigned)c);
-            } else {
-                sb_putc(b, (char)c);
-            }
+            if (c < 0x20) sb_printf(b, "\\u%04x", (unsigned)c);
+            else          sb_putc(b, (char)c);
         }
     }
     sb_putc(b, '"');
 }
 
-/* ------------------------------------------------------------------ */
-/* SchemaRegistry                                                       */
-/* ------------------------------------------------------------------ */
-#define MB_MAX_COLS 64
-#define MB_MAX_TABLES 64
-
+/* ================================================================== */
+/* [4] SchemaRegistry: table_id -> TableSchema, per-file lifetime.       */
+/* ================================================================== */
 typedef struct {
-    int in_use;
     uint64_t table_id;
     char db[128];
     char table[128];
     int column_count;
     uint8_t column_types[MB_MAX_COLS];
-    int varchar_len_bytes[MB_MAX_COLS]; /* 1 or 2, else 0 */
-    int nullable_count;
-} schema_entry;
+    int varchar_len_bytes[MB_MAX_COLS]; /* 1 or 2 length-prefix bytes */
+    int nullable_count;                 /* popcount of null bitmap */
+} table_schema;
 
 typedef struct {
-    schema_entry entries[MB_MAX_TABLES];
+    table_schema entries[MB_MAX_TABLES];
     int count;
 } registry;
 
-static void reg_put(registry *g, const schema_entry *e)
+static void reg_init(registry *g)
+{
+    memset(g, 0, sizeof(*g));
+}
+
+static void reg_put(registry *g, const table_schema *e)
 {
     int i;
+
     for (i = 0; i < g->count; ++i) {
         if (g->entries[i].table_id == e->table_id) {
             g->entries[i] = *e;
@@ -210,22 +279,105 @@ static void reg_put(registry *g, const schema_entry *e)
     if (g->count < MB_MAX_TABLES) g->entries[g->count++] = *e;
 }
 
-static schema_entry *reg_get(registry *g, uint64_t table_id)
+static const table_schema *reg_get(const registry *g, uint64_t table_id)
 {
     int i;
+
     for (i = 0; i < g->count; ++i)
         if (g->entries[i].table_id == table_id) return &g->entries[i];
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Header                                                               */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* [5] RowDecoder: decode a row sequence against a TableSchema.         */
+/* ================================================================== */
+
+/* Decode one column value and append it to the JSON builder. */
+static mb_status decode_value(reader *r, const table_schema *s, int col,
+                              int is_null, sb *b)
+{
+    if (is_null) {
+        sb_puts(b, "null");
+        return MB_OK;
+    }
+
+    switch (s->column_types[col]) {
+    case MB_TYPE_LONGLONG: {
+        int64_t v = (int64_t)rd_le(r, 8);
+        sb_printf(b, "%lld", (long long)v);
+        break;
+    }
+    case MB_TYPE_LONG: {
+        int32_t v = (int32_t)(uint32_t)rd_le(r, 4);
+        sb_printf(b, "%lld", (long long)v);
+        break;
+    }
+    case MB_TYPE_VARCHAR: {
+        char val[512];
+        int lb = s->varchar_len_bytes[col];
+        uint64_t slen;
+
+        if (lb != 1 && lb != 2) return MB_ERR_UNSUPPORTED;
+        slen = rd_le(r, (size_t)lb);
+        if (slen > sizeof(val) - 1) return MB_ERR_UNSUPPORTED;
+        rd_strn(r, (size_t)slen, val, sizeof(val));
+        sb_json_str(b, val);
+        break;
+    }
+    default:
+        return MB_ERR_UNSUPPORTED;
+    }
+    return r->error ? MB_ERR_TRUNCATED : MB_OK;
+}
+
+/* Emit the "rows" array. present_bitmap tells which columns carry values;
+   UPDATE events carry two bitmaps but the second is implicitly handled by
+   reading a second row. */
+static mb_status decode_rows(reader *r, const table_schema *s,
+                             uint64_t present_bitmap, sb *b)
+{
+    int nb_size = (s->nullable_count + 7) / 8;
+    int rowno = 0;
+
+    sb_puts(b, ",\"rows\":[");
+
+    while (rem(r) > 0 && !r.error) {
+        uint64_t null_bitmap;
+        int i, first = 1;
+        mb_status st;
+
+        if (nb_size > 8) return MB_ERR_UNSUPPORTED;
+        null_bitmap = rd_le(r, (size_t)nb_size);
+        if (r.error) break;
+
+        if (rowno) sb_putc(b, ',');
+        sb_putc(b, '[');
+        for (i = 0; i < s->column_count; ++i) {
+            if (!(present_bitmap & (1ULL << i))) continue;
+            if (!first) sb_putc(b, ',');
+            first = 0;
+            st = decode_value(r, s, i,
+                              (null_bitmap & (1ULL << i)) != 0, b);
+            if (st != MB_OK) return st;
+            if (r.error) return MB_ERR_TRUNCATED;
+        }
+        sb_putc(b, ']');
+        ++rowno;
+    }
+    sb_puts(b, "]}");
+    return r->error ? MB_ERR_TRUNCATED : MB_OK;
+}
+
+/* ================================================================== */
+/* [6] EventParser: header, framing, per-event dispatch.                */
+/* ================================================================== */
+
 mb_status mb_parse_header(const uint8_t *data, size_t size, mb_event_header *h)
 {
     reader r;
-    if (!data || !h || size < 19) return MB_ERR_TRUNCATED;
-    r.p = data; r.len = size; r.pos = 0; r.error = 0;
+
+    if (!data || !h || size < MB_HEADER_SIZE) return MB_ERR_TRUNCATED;
+    rd_init(&r, data, size);
     h->timestamp     = (uint32_t)rd_le(&r, 4);
     h->event_type    = (uint8_t)rd_le(&r, 1);
     h->server_id     = (uint32_t)rd_le(&r, 4);
@@ -237,284 +389,323 @@ mb_status mb_parse_header(const uint8_t *data, size_t size, mb_event_header *h)
 
 static const char *rows_name(uint8_t t)
 {
-    if (t == 30) return "WRITE_ROWS_EVENT_V2";
-    if (t == 31) return "UPDATE_ROWS_EVENT_V2";
-    if (t == 32) return "DELETE_ROWS_EVENT_V2";
+    if (t == MB_EV_WRITE_ROWS_V2)  return "WRITE_ROWS_EVENT_V2";
+    if (t == MB_EV_UPDATE_ROWS_V2) return "UPDATE_ROWS_EVENT_V2";
+    if (t == MB_EV_DELETE_ROWS_V2) return "DELETE_ROWS_EVENT_V2";
     return "ROWS_EVENT_V2";
 }
 
-/* ------------------------------------------------------------------ */
-/* Whole-buffer parser                                                   */
-/* ------------------------------------------------------------------ */
+/* Parse FORMAT_DESCRIPTION_EVENT and append its JSON. */
+static mb_status parse_fde(reader *r, const mb_event_header *h,
+                           size_t body_len, const uint8_t *body, sb *b)
+{
+    uint16_t binlog_version;
+    uint8_t version_raw[50];
+    char server_version[64];
+    uint8_t checksum_alg;
+    size_t k = 0;
+
+    if (body_len < 2 + 50 + 1) return MB_ERR_TRUNCATED;
+    binlog_version = (uint16_t)rd_le(r, 2);
+    rd_raw(r, 50, version_raw);
+    while (k < 50 && version_raw[k]) {
+        server_version[k] = (char)version_raw[k];
+        ++k;
+    }
+    server_version[k] = '\0';
+    checksum_alg = body[body_len - 1];
+
+    sb_printf(b,
+        "{\"type\":\"FORMAT_DESCRIPTION_EVENT\",\"timestamp\":%lld,"
+        "\"binlog_version\":%lld,\"server_version\":",
+        (long long)h->timestamp, (long long)binlog_version);
+    sb_json_str(b, server_version);
+    sb_printf(b, ",\"checksum_alg\":%lld}", (long long)checksum_alg);
+    return r->error ? MB_ERR_TRUNCATED : MB_OK;
+}
+
+/* Parse GTID_LOG_EVENT and append its JSON. */
+static mb_status parse_gtid(reader *r, const mb_event_header *h, sb *b)
+{
+    static const char hex[] = "0123456789abcdef";
+    uint8_t sid[16];
+    char sidhex[33];
+    uint64_t gno;
+    int i;
+
+    rd_le(r, 1); /* flags */
+    rd_raw(r, 16, sid);
+    gno = rd_le(r, 8);
+    if (r->error) return MB_ERR_TRUNCATED;
+    for (i = 0; i < 16; ++i) {
+        sidhex[2 * i]     = hex[sid[i] >> 4];
+        sidhex[2 * i + 1] = hex[sid[i] & 0x0f];
+    }
+    sidhex[32] = '\0';
+
+    sb_printf(b,
+        "{\"type\":\"GTID_LOG_EVENT\",\"timestamp\":%lld,\"gno\":%lld,\"sid\":",
+        (long long)h->timestamp, (long long)gno);
+    sb_json_str(b, sidhex);
+    sb_puts(b, "}");
+    return MB_OK;
+}
+
+/* Parse QUERY_EVENT and append its JSON. */
+static mb_status parse_query(reader *r, const mb_event_header *h, sb *b)
+{
+    char db[128], query[2048];
+    uint8_t db_len;
+    uint16_t sv_len;
+
+    rd_le(r, 4);                       /* thread_id */
+    rd_le(r, 4);                       /* exec_time */
+    db_len = (uint8_t)rd_le(r, 1);
+    rd_le(r, 2);                       /* error_code */
+    sv_len = (uint16_t)rd_le(r, 2);
+    rd_skip(r, sv_len);                /* status_vars */
+    rd_strn(r, db_len, db, sizeof(db));
+    rd_le(r, 1);                       /* trailing NUL after db */
+    rd_strn(r, rem(r), query, sizeof(query));
+    if (r->error) return MB_ERR_TRUNCATED;
+
+    sb_printf(b, "{\"type\":\"QUERY_EVENT\",\"timestamp\":%lld,\"db\":",
+              (long long)h->timestamp);
+    sb_json_str(b, db);
+    sb_printf(b, ",\"query\":");
+    sb_json_str(b, query);
+    sb_puts(b, "}");
+    return MB_OK;
+}
+
+/* Parse TABLE_MAP_EVENT, register the schema, and append its JSON. */
+static mb_status parse_table_map(reader *r, const mb_event_header *h,
+                                 registry *reg, sb *b)
+{
+    table_schema s;
+    char db[128], table[128];
+    uint64_t cc, md_len;
+    uint8_t db_len, table_len;
+    size_t md_start, nb;
+    uint64_t null_bitmap;
+    int i;
+
+    memset(&s, 0, sizeof(s));
+    s.table_id = rd_le(r, 6);
+    rd_le(r, 2);                       /* flags */
+    db_len = (uint8_t)rd_le(r, 1);
+    rd_strn(r, db_len, db, sizeof(db));
+    rd_le(r, 1);                       /* NUL */
+    table_len = (uint8_t)rd_le(r, 1);
+    rd_strn(r, table_len, table, sizeof(table));
+    rd_le(r, 1);                       /* NUL */
+    cc = rd_lenenc(r);
+    if (r->error) return MB_ERR_TRUNCATED;
+    if (cc == 0 || cc > MB_MAX_COLS) return MB_ERR_UNSUPPORTED;
+    s.column_count = (int)cc;
+    for (i = 0; i < s.column_count; ++i)
+        s.column_types[i] = (uint8_t)rd_le(r, 1);
+    md_len = rd_lenenc(r);
+    md_start = r->pos;
+    if (r->error || md_len > r->len || md_start > r->len - (size_t)md_len)
+        return MB_ERR_TRUNCATED;
+
+    for (i = 0; i < s.column_count; ++i) {
+        if (s.column_types[i] == MB_TYPE_VARCHAR) {
+            uint16_t maxlen;
+            if (r->pos + 2 > md_start + (size_t)md_len)
+                return MB_ERR_TRUNCATED;
+            maxlen = (uint16_t)rd_le(r, 2);
+            s.varchar_len_bytes[i] = (maxlen > 255) ? 2 : 1;
+        }
+    }
+    r->pos = md_start + (size_t)md_len; /* skip any extra metadata */
+
+    nb = ((size_t)s.column_count + 7) / 8;
+    if (nb > 8) return MB_ERR_UNSUPPORTED;
+    null_bitmap = rd_le(r, nb);
+    for (i = 0; i < s.column_count; ++i)
+        if (null_bitmap & (1ULL << i)) ++s.nullable_count;
+    if (r->error) return MB_ERR_TRUNCATED;
+
+    memcpy(s.db, db, sizeof(db));
+    memcpy(s.table, table, sizeof(table));
+    reg_put(reg, &s);
+
+    sb_printf(b,
+        "{\"type\":\"TABLE_MAP_EVENT\",\"timestamp\":%lld,"
+        "\"table_id\":%lld,\"db\":",
+        (long long)h->timestamp, (long long)s.table_id);
+    sb_json_str(b, s.db);
+    sb_printf(b, ",\"table\":");
+    sb_json_str(b, s.table);
+    sb_printf(b, ",\"column_count\":%lld,\"column_types\":[",
+              (long long)s.column_count);
+    for (i = 0; i < s.column_count; ++i) {
+        if (i) sb_putc(b, ',');
+        sb_printf(b, "%lld", (long long)s.column_types[i]);
+    }
+    sb_puts(b, "]}");
+    return MB_OK;
+}
+
+/* Parse WRITE/UPDATE/DELETE_ROWS_EVENT_V2 and append its JSON. */
+static mb_status parse_rows_v2(reader *r, const mb_event_header *h,
+                               const registry *reg, sb *b)
+{
+    uint64_t table_id, cc, present_bitmap;
+    uint16_t extra_len;
+    size_t bm_size;
+    const table_schema *s;
+
+    table_id = rd_le(r, 6);
+    rd_le(r, 2);                       /* flags */
+    extra_len = (uint16_t)rd_le(r, 2); /* includes its own 2 bytes */
+    if (extra_len < 2) return MB_ERR_UNSUPPORTED;
+    rd_skip(r, (size_t)(extra_len - 2));
+    cc = rd_lenenc(r);
+    if (r->error) return MB_ERR_TRUNCATED;
+    if (cc == 0 || cc > MB_MAX_COLS) return MB_ERR_UNSUPPORTED;
+    bm_size = (size_t)((cc + 7) / 8);
+    if (bm_size > 8) return MB_ERR_UNSUPPORTED;
+    present_bitmap = rd_le(r, bm_size);
+    if (h->event_type == MB_EV_UPDATE_ROWS_V2)
+        rd_le(r, bm_size);             /* before/after bitmap (equal here) */
+    if (r->error) return MB_ERR_TRUNCATED;
+
+    s = reg_get(reg, table_id);
+    if (!s) return MB_ERR_NO_SCHEMA;
+
+    sb_printf(b, "{\"type\":\"%s\",\"timestamp\":%lld,"
+              "\"table_id\":%lld,\"db\":",
+              rows_name(h->event_type), (long long)h->timestamp,
+              (long long)table_id);
+    sb_json_str(b, s->db);
+    sb_printf(b, ",\"table\":");
+    sb_json_str(b, s->table);
+    return decode_rows(r, s, present_bitmap, b);
+}
+
+/* Dispatch a single verified event body to its handler. */
+static mb_status dispatch_event(const mb_event_header *h, const uint8_t *body,
+                                size_t body_len, registry *reg, sb *b)
+{
+    reader r;
+    char q[2048];
+
+    rd_init(&r, body, body_len);
+
+    switch (h->event_type) {
+    case MB_EV_FORMAT_DESC:
+        return parse_fde(&r, h, body_len, body, b);
+
+    case MB_EV_GTID:
+        return parse_gtid(&r, h, b);
+
+    case MB_EV_QUERY:
+        return parse_query(&r, h, b);
+
+    case MB_EV_ROWS_QUERY: {
+        uint64_t len = rd_lenenc(&r);
+        if (r.error) return MB_ERR_TRUNCATED;
+        rd_strn(&r, (size_t)len, q, sizeof(q));
+        if (r.error) return MB_ERR_TRUNCATED;
+        sb_printf(b,
+            "{\"type\":\"ROWS_QUERY_LOG_EVENT\",\"timestamp\":%lld,\"query\":",
+            (long long)h->timestamp);
+        sb_json_str(b, q);
+        sb_puts(b, "}");
+        return MB_OK;
+    }
+
+    case MB_EV_TABLE_MAP:
+        return parse_table_map(&r, h, reg, b);
+
+    case MB_EV_WRITE_ROWS_V2:
+    case MB_EV_UPDATE_ROWS_V2:
+    case MB_EV_DELETE_ROWS_V2:
+        return parse_rows_v2(&r, h, reg, b);
+
+    case MB_EV_XID: {
+        uint64_t xid = rd_le(&r, 8);
+        if (r.error) return MB_ERR_TRUNCATED;
+        sb_printf(b, "{\"type\":\"XID_EVENT\",\"timestamp\":%lld,\"xid\":%lld}",
+                  (long long)h->timestamp, (long long)xid);
+        return MB_OK;
+    }
+
+    case MB_EV_ROTATE: {
+        uint64_t position = rd_le(&r, 8);
+        char next_file[512];
+        rd_strn(&r, rem(&r), next_file, sizeof(next_file));
+        if (r.error) return MB_ERR_TRUNCATED;
+        sb_printf(b,
+            "{\"type\":\"ROTATE_EVENT\",\"timestamp\":%lld,"
+            "\"position\":%lld,\"next_file\":",
+            (long long)h->timestamp, (long long)position);
+        sb_json_str(b, next_file);
+        sb_puts(b, "}");
+        return MB_OK;
+    }
+
+    default: /* UNKNOWN -> safe skip, emit a stable one-line record */
+        sb_printf(b,
+            "{\"type\":\"UNKNOWN\",\"timestamp\":%lld,"
+            "\"type_id\":%lld,\"event_size\":%lld}",
+            (long long)h->timestamp, (long long)h->event_type,
+            (long long)h->event_size);
+        return MB_OK;
+    }
+}
+
+/* ================================================================== */
+/* [7] Public API: whole-buffer parser.                                  */
+/* ================================================================== */
 mb_status mb_parse_buffer(const uint8_t *data, size_t size, FILE *out)
 {
-    size_t pos;
+    static const uint8_t magic[MB_MAGIC_SIZE] = { 0xFE, 0x62, 0x69, 0x6E };
     registry reg;
+    size_t pos;
 
-    if (!data || !out || size < 4) return MB_ERR_INVALID;
-    if (!(data[0] == 0xFE && data[1] == 'b' && data[2] == 'i' && data[3] == 'n'))
-        return MB_ERR_INVALID;
+    if (!data || !out || size < MB_MAGIC_SIZE) return MB_ERR_INVALID;
+    if (memcmp(data, magic, MB_MAGIC_SIZE) != 0) return MB_ERR_INVALID;
 
-    memset(&reg, 0, sizeof(reg));
-    pos = 4; /* skip magic */
+    reg_init(&reg);
+    pos = MB_MAGIC_SIZE;
 
     while (pos < size) {
-        const uint8_t *full;
-        const uint8_t *body;
-        size_t body_len, es;
+        const uint8_t *full, *body;
+        size_t es, body_len;
         mb_event_header h;
-        reader r;
-        char linebuf[16384];
+        char linebuf[MB_LINE_CAP];
         sb b;
         uint32_t stored, calc;
-        int is_null;
-        mb_status st = MB_OK;
+        mb_status st;
 
-        if (pos + 19 > size) return MB_ERR_TRUNCATED;
-        if (mb_parse_header(data + pos, 19, &h) != MB_OK) return MB_ERR_TRUNCATED;
+        if (size - pos < MB_HEADER_SIZE) return MB_ERR_TRUNCATED;
+        if (mb_parse_header(data + pos, MB_HEADER_SIZE, &h) != MB_OK)
+            return MB_ERR_TRUNCATED;
+
         es = h.event_size;
-        if (es < 19 + 4 || pos + es > size) return MB_ERR_TRUNCATED;
+        if (es < MB_HEADER_SIZE + MB_CRC_SIZE || es > MB_MAX_EVENT_SIZE ||
+            es > size - pos)
+            return MB_ERR_TRUNCATED;
 
         full = data + pos;
         /* Every event in the controlled subset carries CRC32 (FDE declares
            checksum_alg=1), so it is verified unconditionally here. */
-        stored = (uint32_t)peek_le(full + es - 4, 4);
-        calc = mb_crc32(full, es - 4);
+        stored = peek_le32(full + es - MB_CRC_SIZE);
+        calc = mb_crc32(full, es - MB_CRC_SIZE);
         if (stored != calc) return MB_ERR_CHECKSUM;
 
-        body = full + 19;
-        body_len = es - 19 - 4;
-        r.p = body; r.len = body_len; r.pos = 0; r.error = 0;
+        body = full + MB_HEADER_SIZE;
+        body_len = es - MB_HEADER_SIZE - MB_CRC_SIZE;
         sb_init(&b, linebuf, sizeof(linebuf));
 
-        switch (h.event_type) {
-        case 15: { /* FORMAT_DESCRIPTION_EVENT */
-            uint16_t binlog_version = (uint16_t)rd_le(&r, 2);
-            uint8_t tmp[50];
-            char server_version[64];
-            uint8_t checksum_alg;
-            size_t k = 0;
-            rd_raw(&r, 50, tmp);
-            while (k < 50 && tmp[k]) { server_version[k] = (char)tmp[k]; ++k; }
-            server_version[k] = '\0';
-            checksum_alg = body[body_len - 1];
-            sb_printf(&b,
-                "{\"type\":\"FORMAT_DESCRIPTION_EVENT\",\"timestamp\":%lld,"
-                "\"binlog_version\":%lld,\"server_version\":",
-                (long long)h.timestamp, (long long)binlog_version);
-            sb_json_str(&b, server_version);
-            sb_printf(&b, ",\"checksum_alg\":%lld}", (long long)checksum_alg);
-            break;
-        }
-        case 33: { /* GTID_LOG_EVENT */
-            char sidhex[33];
-            uint8_t sid[16];
-            uint64_t gno;
-            int i;
-            static const char hex[] = "0123456789abcdef";
-            rd_le(&r, 1); /* flags */
-            rd_raw(&r, 16, sid);
-            gno = rd_le(&r, 8);
-            for (i = 0; i < 16; ++i) {
-                sidhex[2 * i]     = hex[sid[i] >> 4];
-                sidhex[2 * i + 1] = hex[sid[i] & 0x0f];
-            }
-            sidhex[32] = '\0';
-            sb_printf(&b,
-                "{\"type\":\"GTID_LOG_EVENT\",\"timestamp\":%lld,\"gno\":%lld,\"sid\":",
-                (long long)h.timestamp, (long long)gno);
-            sb_json_str(&b, sidhex);
-            sb_puts(&b, "}");
-            break;
-        }
-        case 2: { /* QUERY_EVENT */
-            char db[128], query[2048];
-            uint8_t db_len;
-            uint16_t sv_len;
-            rd_le(&r, 4); /* thread_id */
-            rd_le(&r, 4); /* exec_time */
-            db_len = (uint8_t)rd_le(&r, 1);
-            rd_le(&r, 2); /* error_code */
-            sv_len = (uint16_t)rd_le(&r, 2);
-            skip(&r, sv_len); /* status_vars */
-            rd_strn(&r, db_len, db, sizeof(db));
-            rd_le(&r, 1); /* trailing NUL after db */
-            rd_strn(&r, rem(&r), query, sizeof(query));
-            sb_printf(&b,
-                "{\"type\":\"QUERY_EVENT\",\"timestamp\":%lld,\"db\":",
-                (long long)h.timestamp);
-            sb_json_str(&b, db);
-            sb_printf(&b, ",\"query\":");
-            sb_json_str(&b, query);
-            sb_puts(&b, "}");
-            break;
-        }
-        case 29: { /* ROWS_QUERY_LOG_EVENT */
-            char q[2048];
-            uint64_t len = rd_lenenc(&r, &is_null);
-            rd_strn(&r, (size_t)len, q, sizeof(q));
-            sb_printf(&b,
-                "{\"type\":\"ROWS_QUERY_LOG_EVENT\",\"timestamp\":%lld,\"query\":",
-                (long long)h.timestamp);
-            sb_json_str(&b, q);
-            sb_puts(&b, "}");
-            break;
-        }
-        case 19: { /* TABLE_MAP_EVENT */
-            schema_entry e;
-            char db[128], table[128];
-            uint64_t cc, md_len;
-            int i, nb, nullable = 0;
-            uint64_t nullbm;
-            size_t md_start;
-            uint8_t db_len, table_len;
-            memset(&e, 0, sizeof(e));
-            e.in_use = 1;
-            e.table_id = rd_le(&r, 6);
-            rd_le(&r, 2); /* flags */
-            db_len = (uint8_t)rd_le(&r, 1);
-            rd_strn(&r, db_len, db, sizeof(db));
-            rd_le(&r, 1); /* NUL */
-            table_len = (uint8_t)rd_le(&r, 1);
-            rd_strn(&r, table_len, table, sizeof(table));
-            rd_le(&r, 1); /* NUL */
-            cc = rd_lenenc(&r, &is_null);
-            e.column_count = (int)cc;
-            for (i = 0; i < e.column_count && i < MB_MAX_COLS; ++i)
-                e.column_types[i] = (uint8_t)rd_le(&r, 1);
-            md_len = rd_lenenc(&r, &is_null);
-            md_start = r.pos;
-            for (i = 0; i < e.column_count; ++i) {
-                if (e.column_types[i] == 15) { /* VARCHAR: 2-byte maxlen */
-                    uint16_t maxlen = (uint16_t)rd_le(&r, 2);
-                    e.varchar_len_bytes[i] = (maxlen > 255) ? 2 : 1;
-                }
-            }
-            r.pos = md_start + (size_t)md_len; /* skip any extra metadata */
-            nb = (e.column_count + 7) / 8;
-            nullbm = rd_le(&r, nb);
-            for (i = 0; i < e.column_count; ++i)
-                if (nullbm & (1ULL << i)) ++nullable;
-            e.nullable_count = nullable;
-            strcpy(e.db, db);
-            strcpy(e.table, table);
-            reg_put(&reg, &e);
-
-            sb_printf(&b,
-                "{\"type\":\"TABLE_MAP_EVENT\",\"timestamp\":%lld,"
-                "\"table_id\":%lld,\"db\":",
-                (long long)h.timestamp, (long long)e.table_id);
-            sb_json_str(&b, e.db);
-            sb_printf(&b, ",\"table\":");
-            sb_json_str(&b, e.table);
-            sb_printf(&b, ",\"column_count\":%lld,\"column_types\":[",
-                (long long)e.column_count);
-            for (i = 0; i < e.column_count; ++i) {
-                if (i) sb_putc(&b, ',');
-                sb_printf(&b, "%lld", (long long)e.column_types[i]);
-            }
-            sb_puts(&b, "]}");
-            break;
-        }
-        case 30: case 31: case 32: { /* ROWS_EVENT_V2 */
-            uint64_t table_id, cc;
-            uint16_t extra_len;
-            int bm_size, nb_size, rowno = 0;
-            uint64_t present1;
-            schema_entry *se;
-
-            table_id = rd_le(&r, 6);
-            rd_le(&r, 2); /* flags */
-            extra_len = (uint16_t)rd_le(&r, 2);
-            if (extra_len >= 2) skip(&r, (size_t)(extra_len - 2));
-            cc = rd_lenenc(&r, &is_null);
-            bm_size = (int)((cc + 7) / 8);
-            present1 = rd_le(&r, bm_size);
-            if (h.event_type == 31) rd_le(&r, bm_size); /* bitmap2, equal */
-            se = reg_get(&reg, table_id);
-            if (!se) { st = MB_ERR_NO_SCHEMA; break; }
-            nb_size = (se->nullable_count + 7) / 8;
-
-            sb_printf(&b, "{\"type\":\"%s\",\"timestamp\":%lld,"
-                "\"table_id\":%lld,\"db\":",
-                rows_name(h.event_type), (long long)h.timestamp,
-                (long long)table_id);
-            sb_json_str(&b, se->db);
-            sb_printf(&b, ",\"table\":");
-            sb_json_str(&b, se->table);
-            sb_printf(&b, ",\"rows\":[");
-
-            while (rem(&r) > 0 && !r.error) {
-                uint64_t nullbm = rd_le(&r, nb_size);
-                int i, first = 1;
-                if (r.error) break;
-                if (rowno) sb_putc(&b, ',');
-                sb_putc(&b, '[');
-                for (i = 0; i < se->column_count; ++i) {
-                    uint8_t t;
-                    if (!(present1 & (1ULL << i))) continue; /* not present */
-                    if (!first) sb_putc(&b, ',');
-                    first = 0;
-                    if (nullbm & (1ULL << i)) { sb_puts(&b, "null"); continue; }
-                    t = se->column_types[i];
-                    if (t == 8) { /* LONGLONG */
-                        int64_t v = (int64_t)rd_le(&r, 8);
-                        sb_printf(&b, "%lld", (long long)v);
-                    } else if (t == 3) { /* LONG */
-                        int32_t v = (int32_t)(uint32_t)rd_le(&r, 4);
-                        sb_printf(&b, "%lld", (long long)v);
-                    } else if (t == 15) { /* VARCHAR */
-                        int lb = se->varchar_len_bytes[i];
-                        char val[512];
-                        uint64_t slen;
-                        if (lb == 0) lb = 1;
-                        slen = rd_le(&r, lb);
-                        rd_strn(&r, (size_t)slen, val, sizeof(val));
-                        sb_json_str(&b, val);
-                    } else {
-                        st = MB_ERR_UNSUPPORTED;
-                        break;
-                    }
-                    if (r.error) break;
-                }
-                sb_putc(&b, ']');
-                if (r.error || st != MB_OK) break;
-                ++rowno;
-            }
-            sb_puts(&b, "]}");
-            break;
-        }
-        case 16: { /* XID_EVENT */
-            uint64_t xid = rd_le(&r, 8);
-            sb_printf(&b, "{\"type\":\"XID_EVENT\",\"timestamp\":%lld,\"xid\":%lld}",
-                (long long)h.timestamp, (long long)xid);
-            break;
-        }
-        case 4: { /* ROTATE_EVENT */
-            uint64_t position = rd_le(&r, 8);
-            char nf[512];
-            rd_strn(&r, rem(&r), nf, sizeof(nf));
-            sb_printf(&b,
-                "{\"type\":\"ROTATE_EVENT\",\"timestamp\":%lld,"
-                "\"position\":%lld,\"next_file\":",
-                (long long)h.timestamp, (long long)position);
-            sb_json_str(&b, nf);
-            sb_puts(&b, "}");
-            break;
-        }
-        default: { /* UNKNOWN -> safe skip */
-            sb_printf(&b,
-                "{\"type\":\"UNKNOWN\",\"timestamp\":%lld,"
-                "\"type_id\":%lld,\"event_size\":%lld}",
-                (long long)h.timestamp, (long long)h.event_type,
-                (long long)h.event_size);
-            break;
-        }
-        }
-
+        st = dispatch_event(&h, body, body_len, &reg, &b);
         if (st != MB_OK) return st;
-        if (r.error) return MB_ERR_TRUNCATED;
         if (b.overflow) return MB_ERR_INVALID;
+
         fputs(linebuf, out);
         fputc('\n', out);
         pos += es;
