@@ -31,8 +31,10 @@
 
 import("format/format.inc")
 
-// The CLI passes `--isa x86-64`; the tutorial's ELF examples rely on that
-// starting target rather than calling x86.use64() here.
+// Select the 64-bit x86 encoder explicitly, as XIRASM's own ELF64 template
+// does; `--isa x86-64` only supplies a starting target for sources that do not
+// choose one themselves. format_elf_begin64() calls this again at format_begin.
+x86.use64()
 
 // ==========================================================================
 // [1] Protocol constants (docs/design.md sections 2-3). All C-like names.
@@ -275,9 +277,25 @@ lenenc_done:
     ret
 
 // ==========================================================================
-// [8] CLI entry. SysV AMD64 ABI: rdi=argc, rsi=argv.
-// libc calls happen only from main's 16-byte-aligned frame.
+// [8] ELF entry + CLI. A dynamic ELF's entry point is a raw `_start`: the
+// loader jumps here with argc/argv ON THE STACK, while rdi/rsi carry loader
+// state (glibc's RTLD_START ends with `jmp *%r12`). Treating the entry as a
+// C `main(argc, argv)` would dereference garbage. Convert it explicitly:
+// read argc/argv off the stack, align rsp, then `call main` as an ordinary
+// SysV function. That call also supplies the 8-byte return address which makes
+// main's `push rbp; sub rsp,32` frame 16-byte aligned for libc printf.
 // ==========================================================================
+_start:
+    xor rbp, rbp                       // outermost frame marker (SysV ABI)
+    mov rdi, [rsp]                     // argc
+    lea rsi, [rsp + 8]                 // argv
+    lea rax, [rsp]
+    and rax, 15
+    sub rsp, rax                       // align rsp down to 16 before call
+    call main
+    mov rdi, rax
+    call exit_plt
+
 main:
     push rbp
     mov rbp, rsp
@@ -1209,5 +1227,5 @@ typename:
 format_segment_end(image, ".bss")
 
 
-format_entry_mut(image, main)
+format_entry_mut(image, _start)
 format_finish(image)
