@@ -951,7 +951,8 @@ selftest:
     mov rsi, 1
     call le_n
     mov [rel dbg_le], rax
-    movzx rax, byte [rel hdr_test_type]
+    lea rdi, [rel hdr_test_type]
+    movzx rax, byte [rdi]
     mov [rel dbg_movzx], rax
     lea rdi, [rel hdr_test + 9]
     mov rsi, 4
