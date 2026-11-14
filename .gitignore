@@ -14,8 +14,36 @@ cpp/build/
 rust/target/
 
 # Go
-go/mysqlbinlog-go
 /mysqlbinlog-go
+
+# Java
+java/out/
+
+# C#
+csharp/out/
+csharp/testout/
+**/bin/
+**/obj/
+
+# Zig
+zig/zig-out/
+zig/.zig-cache/
+zig/zig-cache/
+
+# Erlang
+erlang/ebin/
+*.beam
+
+# Python
+__pycache__/
+*.pyc
+
+# Assembly
+asm/main.o
+asm/mysqlbinlog-asm
+
+# CI scratch output
+/out.jsonl
 
 # Local compiler outputs (should never be produced locally; guard anyway)
 /mysqlbinlog-c
@@ -23,9 +51,7 @@ go/mysqlbinlog-go
 /mysqlbinlog-rust
 *.exe
 
-# Python / editor / OS
-__pycache__/
-*.pyc
+# Editor / OS
 .vscode/
 .idea/
 .DS_Store

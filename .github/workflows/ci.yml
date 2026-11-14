@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lang: [c, cpp, rust, go]
+        lang: [c, cpp, rust, go, java, csharp, zig, erlang, python, asm]
     steps:
       - uses: actions/checkout@v4
 
@@ -29,13 +29,58 @@ jobs:
         if: matrix.lang == 'rust'
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Java
+        if: matrix.lang == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup .NET
+        if: matrix.lang == 'csharp'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Setup Zig
+        if: matrix.lang == 'zig'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: '0.13.0'
+
+      - name: Setup Python
+        if: matrix.lang == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Erlang/OTP
+        if: matrix.lang == 'erlang'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erlang
+
+      - name: Setup NASM
+        if: matrix.lang == 'asm'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nasm
+
       - name: Toolchain versions
         run: |
+          echo "lang=${{ matrix.lang }}"
           cmake --version | head -1
           gcc --version | head -1
           python3 --version
-          if [ "${{ matrix.lang }}" = "go" ]; then go version; fi
-          if [ "${{ matrix.lang }}" = "rust" ]; then rustc --version; cargo --version; fi
+          case "${{ matrix.lang }}" in
+            go) go version ;;
+            rust) rustc --version; cargo --version ;;
+            java) javac -version ;;
+            csharp) dotnet --version ;;
+            zig) zig version ;;
+            erlang) command -v erlc; command -v escript ;;
+            asm) nasm -v ;;
+          esac
 
       - name: Generate & verify fixtures (no drift)
         run: |
@@ -78,6 +123,60 @@ jobs:
           go test ./...
           cd ..
           ./mysqlbinlog-go --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (Java)
+        if: matrix.lang == 'java'
+        run: |
+          set -e
+          mkdir -p java/out
+          javac -d java/out $(find java/src java/test -name '*.java')
+          java -cp java/out mysqlbinlog.ParserTest
+          java -cp java/out mysqlbinlog.Cli --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (C#)
+        if: matrix.lang == 'csharp'
+        run: |
+          set -e
+          dotnet build csharp/src/MysqlBinlog.csproj -c Release -o csharp/out
+          dotnet build csharp/tests/MysqlBinlog.Tests.csproj -c Release -o csharp/testout
+          dotnet csharp/testout/MysqlBinlog.Tests.dll
+          dotnet csharp/out/mysqlbinlog-cs.dll --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (Zig)
+        if: matrix.lang == 'zig'
+        run: |
+          set -e
+          cd zig
+          zig build -Doptimize=ReleaseSafe
+          zig build test -Doptimize=ReleaseSafe
+          cd ..
+          ./zig/zig-out/bin/mysqlbinlog-zig --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (Erlang)
+        if: matrix.lang == 'erlang'
+        run: |
+          set -e
+          mkdir -p erlang/ebin
+          erlc -o erlang/ebin erlang/src/*.erl erlang/test/*.erl
+          erl -noshell -pa erlang/ebin -eval 'case eunit:test(mysqlbinlog_tests,[verbose]) of ok -> halt(0); _ -> halt(1) end.'
+          escript erlang/mysqlbinlog-erl --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (Python)
+        if: matrix.lang == 'python'
+        run: |
+          set -e
+          python3 -m py_compile python/mysqlbinlog.py python/mysqlbinlog_cli.py python/test_parser.py
+          python3 -m unittest discover -s python -p 'test_*.py' -v
+          python3 python/mysqlbinlog_cli.py --file fixtures/demo.bin --format jsonl > out.jsonl
+
+      - name: Build, unit test, run (x86-64 asm)
+        if: matrix.lang == 'asm'
+        run: |
+          set -e
+          nasm -felf64 asm/main.asm -o asm/main.o
+          gcc -no-pie -o asm/mysqlbinlog-asm asm/main.o
+          ./asm/mysqlbinlog-asm --self-test
+          ./asm/mysqlbinlog-asm --file fixtures/demo.bin --format jsonl > out.jsonl
 
       - name: Golden diff (must match expected.jsonl byte-for-byte)
         run: |

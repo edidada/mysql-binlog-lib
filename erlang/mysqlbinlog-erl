@@ -1,0 +1,7 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%% CLI: escript erlang/mysqlbinlog-erl --file <path> [--format jsonl]
+main(Args) ->
+    Dir = filename:dirname(escript:script_name()),
+    code:add_patha(filename:join(Dir, "ebin")),
+    mysqlbinlog_cli:run(Args).

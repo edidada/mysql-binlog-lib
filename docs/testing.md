@@ -4,20 +4,37 @@
 
 ## 1. 测试目标
 
-1. 四种语言都能**编译**通过。
-2. 四种语言都能**运行**（CLI 正常退出、单测通过）。
-3. 四种语言对**同一份 binlog 字节**输出**完全一致**的 JSONL（Golden Test）。
+1. 十种语言都能**编译 / 构建**通过（解释型语言做语法检查）。
+2. 十种语言都能**运行**（CLI 正常退出、单测通过）。
+3. 十种语言对**同一份 binlog 字节**输出**完全一致**的 JSONL（Golden Test）。
 4. 解析器对损坏 / 截断输入具备边界防御（Fuzz 规划）。
 
 ## 2. 测试分层
 
 | 层次 | 位置 | 覆盖内容 | 由谁跑 |
 | --- | --- | --- | --- |
-| 单元测试 | 各语言 `tests/` / `#[cfg(test)]` / `_test.go` | ByteReader、事件头、CRC32、lenenc、行值解码 | CI 各语言 job |
+| 单元测试 | 各语言 `tests/` / `#[cfg(test)]` / `_test.go` / EUnit / unittest | ByteReader、事件头、CRC32、lenenc、行值解码 | CI 各语言 job |
 | Golden 测试 | `fixtures/demo.bin` + `fixtures/expected.jsonl` | 全事件序列端到端解析、跨语言一致性 | CI 各语言 job（diff） |
-| 一致性测试 | 同上 | 四语言输出两两比对（等价于各自 == golden） | CI 隐含 |
+| 一致性测试 | 同上 | 十语言输出两两比对（等价于各自 == golden） | CI 隐含 |
 | 完整性校验 | `fixtures/gen_fixture.py` | 提交的 demo.bin/expected.jsonl 可复现、无漂移 | CI `git diff --exit-code` |
 | Fuzz / 集成 / 基准 | 规划中 | 损坏字节、真实 MySQL 5.7/8.0/8.4、吞吐 | Phase 5（见 §6） |
+
+### 2.1 各语言单测载体（CI 矩阵 `lang ∈ {c, cpp, rust, go, java, csharp, zig, erlang, python, asm}`）
+
+| 语言 | 单测入口 | 工具链 |
+| --- | --- | --- |
+| c / cpp | `CTest` → `assert` 程序 | cmake + gcc/g++ |
+| rust | `cargo test` (`#[cfg(test)]`，含 `@embedFile` golden) | Rust stable |
+| go | `go test ./...` (`testing`，含 golden) | Go 1.23 |
+| java | `java -cp out mysqlbinlog.ParserTest`（自建断言，含 golden） | JDK 21 `javac` |
+| csharp | `dotnet <Tests>.dll`（自建断言，含 golden） | .NET 8 |
+| zig | `zig build test`（`test` 块，含 `@embedFile` golden） | Zig 0.13.0 |
+| erlang | `eunit:test/2`（含 golden） | OTP `erlc` / `erl` |
+| python | `python3 -m unittest discover`（含 golden） | Python 3 |
+| asm | `./mysqlbinlog-asm --self-test`（CRC 向量 + header 字段） | nasm + gcc -no-pie |
+
+Rust / Go / Java / C# / Zig / Erlang / Python 的单测内部还各做一次 golden 比对；
+C / C++ / asm 的端到端一致性由 CI 的 `diff -u expected.jsonl out.jsonl` 保证。
 
 ## 3. Golden Test（核心）
 
@@ -42,7 +59,7 @@ git diff --exit-code -- fixtures/demo.bin fixtures/expected.jsonl   # 无漂移
 diff -u fixtures/expected.jsonl out.jsonl        # 与基准逐字节一致
 ```
 
-四份 `out.jsonl` 都等于同一 `expected.jsonl`，即天然满足两两一致。
+十份 `out.jsonl` 都等于同一 `expected.jsonl`，即天然满足两两一致。
 
 ### 3.3 事件覆盖矩阵
 
@@ -69,15 +86,15 @@ diff -u fixtures/expected.jsonl out.jsonl        # 与基准逐字节一致
 - Row 解码：整数、VARCHAR、NULL 位图、before/after。
 - 截断输入 / 非法 magic / CRC 错误 → 返回错误码而非崩溃。
 
-C/C++ 用 `assert` + CTest；Rust 用 `#[cfg(test)]` + `cargo test`；Go 用标准库 `testing` + `go test ./...`。
+C/C++ 用 `assert` + CTest；Rust 用 `#[cfg(test)]` + `cargo test`；Go 用标准库 `testing` + `go test ./...`；Java / C# 用自建断言 `main`（避免引入 JUnit / xUnit 等第三方包）；Zig 用 `test` 块；Erlang 用 EUnit（OTP 自带）；Python 用 `unittest`（标准库）；汇编用 `--self-test`。
 
 ## 5. 如何新增测试用例
 
 1. 在 `fixtures/gen_fixture.py` 中追加事件（同时产出字节与期望行）。
 2. 本地（仅数据生成，不编译）：`python fixtures/gen_fixture.py`（Windows 用 `python`；CI 用 `python3`）。
 3. 提交 `demo.bin` 与 `expected.jsonl`。
-4. 在四语言解码器补齐对应分支，**不要**修改 canonical JSON 序列化规则之外的输出。
-5. Push → CI 自动验证四语言是否同时通过。
+4. 在**十语言**解码器逐一补齐对应分支，**不要**修改 canonical JSON 序列化规则之外的输出。
+5. Push → CI 自动验证十语言是否同时通过。
 
 > 严禁只改某一个语言的输出去「迁就」实现差异；canonical JSONL 以 `gen_fixture.py` 为准。
 

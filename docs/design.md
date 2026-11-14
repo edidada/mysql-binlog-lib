@@ -1,6 +1,6 @@
 # 详细设计（Detailed Design）
 
-> 本文是 `mysql-binlog-lib` 的**实现规约**，是四语言（C / C++ / Rust / Go）编码与 golden test 的唯一基准。
+> 本文是 `mysql-binlog-lib` 的**实现规约**，是十语言（C / C++ / Rust / Go / Java / C# / Zig / Erlang / Python / x86-64 汇编）编码与 golden test 的唯一基准。
 > 概要设计与路线图见 [overview.md](overview.md)；测试策略见 [testing.md](testing.md)；发布与故障处理见 [ops-sop.md](ops-sop.md)。
 
 ## 1. 本期范围（Phase 1：离线 Binlog 解析基线）
@@ -8,11 +8,11 @@
 本期交付**离线 Binlog 解析器**：读取 `mysql-bin.000001` 这类文件，按字节解码事件，输出统一的 JSONL。
 暂不实现在线 CDC（3306 复制协议）、Snapshot、Kafka Sink（属 Phase 3/4，见 overview.md）。
 
-四种语言**各自独立**实现 Library + CLI + 单测，不通过 FFI 互相调用，共享同一份测试字节与输出规范，便于对比实现质量。
+十种语言**各自独立**实现 Library + CLI + 单测，不通过 FFI 互相调用，共享同一份测试字节与输出规范，便于对比实现质量。
 
 ### 1.1 受控子集（Controlled Subset）
 
-为让四种语言在没有本地编译条件、仅靠 CI 验证的情况下能可靠对齐，fixtures 使用一组**明确定义、可复现**的字节：
+为让十种语言在没有本地编译条件、仅靠 CI 验证的情况下能可靠对齐，fixtures 使用一组**明确定义、可复现**的字节：
 
 - MySQL Version 4 binlog 格式族；`binlog_format=ROW`；`binlog_row_image=FULL`。
 - 未加密、未压缩、未启用行值压缩。
@@ -191,7 +191,7 @@ ROTATE: 8 字节 u64 LE position + 剩余字节 next_file（字符串）
 
 ## 4. 模块划分与状态机
 
-四语言统一采用 `Parser + Reader + SchemaRegistry + Serializer` 模型：
+十语言统一采用 `Parser + Reader + SchemaRegistry + Serializer` 模型：
 
 ```
 read_file
@@ -250,17 +250,36 @@ UNKNOWN                  : type,timestamp,type_id,event_size
 
 ## 7. 各语言工程结构
 
+十语言互不使用 FFI，各自独立实现同一套 `Parser + Reader + SchemaRegistry + Serializer` 模型。
+
 ```
-c/     CMakeLists.txt, include/mysqlbinlog.h, src/mysqlbinlog.c,
-       examples/main.c, tests/test_parser.c            (C11, -Wall -Wextra, CTest)
-cpp/   CMakeLists.txt, include/mysqlbinlog.hpp, src/mysqlbinlog.cpp,
-       examples/main.cpp, tests/test_parser.cpp        (C++17, CTest)
-rust/  Cargo.toml, src/lib.rs (#[cfg(test)] 单测), src/main.rs  (零外部依赖)
-go/    go.mod, binlog/parser.go, binlog/parser_test.go,
-       cmd/mysqlbinlog/main.go                         (标准库)
+c/       CMakeLists.txt, include/mysqlbinlog.h, src/mysqlbinlog.c,
+         examples/main.c, tests/test_parser.c          (C11, -Wall -Wextra, CTest)
+cpp/     CMakeLists.txt, include/mysqlbinlog.hpp, src/mysqlbinlog.cpp,
+         examples/main.cpp, tests/test_parser.cpp      (C++17, CTest)
+rust/    Cargo.toml, src/lib.rs (#[cfg(test)] 单测), src/main.rs  (零外部依赖)
+go/      go.mod, binlog/parser.go, binlog/parser_test.go,
+         cmd/mysqlbinlog/main.go                       (标准库)
+java/    src/mysqlbinlog/{Parser,Cli}.java,
+         test/mysqlbinlog/ParserTest.java             (JDK 21 javac, 零依赖)
+csharp/  src/{Parser.cs, Program.cs, MysqlBinlog.csproj},
+         tests/{Program.cs, MysqlBinlog.Tests.csproj} (.NET 8, 无 NuGet 包)
+zig/     build.zig, src/{parser.zig,main.zig}         (Zig 0.13.0, zig build test)
+erlang/  src/{mysqlbinlog.erl,mysqlbinlog_cli.erl}, test/mysqlbinlog_tests.erl,
+         mysqlbinlog-erl (escript)                    (OTP erlc + EUnit)
+python/  mysqlbinlog.py, mysqlbinlog_cli.py, test_parser.py (标准库 unittest)
+asm/     main.asm                                    (x86-64 NASM + gcc -no-pie)
 ```
 
-- 依赖策略：**全部零第三方依赖**，避免 CI 拉取网络依赖导致不稳定。CRC32 在 C/C++/Rust 手写查表/位运算，Go 用标准库 `hash/crc32.ChecksumIEEE`（与 zlib 一致）。
+| 语言 | CRC32 实现 | 单测载体 | 备注 |
+| --- | --- | --- | --- |
+| C / C++ / Java / C# / Zig / Erlang / asm / Python | 手写位运算（IEEE） | 各自 runner | 与 zlib 标准向量一致 |
+| Go | 标准库 `hash/crc32.ChecksumIEEE` | `go test` | 与 zlib 一致 |
+| Rust | 手写位运算 | `#[cfg(test)]` | 零外部 crate |
+
+- 依赖策略：**全部零第三方库依赖**，避免 CI 拉取网络依赖导致不稳定。工具链本身由 CI 的 setup action / apt 安装（见 ops-sop.md §1），不算库依赖。
+- Python 用 `json.dumps(..., separators=(',',':'))` + 保序 dict 生成 canonical JSONL；其余语言手写 serializer，保证键序一致。
+- 汇编版 (xirasm) 用 libc `printf` 输出，字符串依赖受控子集「纯 ASCII 无特殊字符」的约束（`%.*s` 不做 JSON 转义）；其余九语言实现完整转义。
 - 构建与验证统一由 `.github/workflows/ci.yml` 完成；**本地不编译**（见 ops-sop.md §2）。
 
 ## 8. 与后续阶段的边界
