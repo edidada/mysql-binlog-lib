@@ -341,14 +341,14 @@ static mb_status decode_rows(reader *r, const table_schema *s,
 
     sb_puts(b, ",\"rows\":[");
 
-    while (rem(r) > 0 && !r.error) {
+    while (rem(r) > 0 && !r->error) {
         uint64_t null_bitmap;
         int i, first = 1;
         mb_status st;
 
         if (nb_size > 8) return MB_ERR_UNSUPPORTED;
         null_bitmap = rd_le(r, (size_t)nb_size);
-        if (r.error) break;
+        if (r->error) break;
 
         if (rowno) sb_putc(b, ',');
         sb_putc(b, '[');
@@ -359,7 +359,7 @@ static mb_status decode_rows(reader *r, const table_schema *s,
             st = decode_value(r, s, i,
                               (null_bitmap & (1ULL << i)) != 0, b);
             if (st != MB_OK) return st;
-            if (r.error) return MB_ERR_TRUNCATED;
+            if (r->error) return MB_ERR_TRUNCATED;
         }
         sb_putc(b, ']');
         ++rowno;
