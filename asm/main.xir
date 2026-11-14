@@ -96,6 +96,7 @@ const FMT_XID:       string = '{"type":"XID_EVENT","timestamp":%llu,"xid":%llu}'
 const FMT_ROTATE:    string = '{"type":"ROTATE_EVENT","timestamp":%llu,"position":%llu,"next_file":"%.*s"}'
 const FMT_QSTR:      string = '"%.*s"'
 const FMT_NUM:       string = '%llu'
+const FMT_DBG:       string = 'dbg crc=%llu ts=%llu le=%llu movzx=%llu es=%llu'
 
 const LIT_COMMA:     string = ','
 const LIT_LBRACK:    string = '['
@@ -941,21 +942,42 @@ selftest:
     lea rdi, [rel lit_crcvec]
     mov rsi, 9
     call crc32
-    cmp eax, MB_CRC32_VECTOR
-    jne selftest_fail
+    mov [rel dbg_crc], rax
     lea rdi, [rel hdr_test]
     mov rsi, 4
     call le_n
-    cmp rax, 1700000000
-    jne selftest_fail
-    // XIRASM's REX.W RIP-relative fixup mishandles label+addend on movzx;
-    // a dedicated label avoids the off-by-one read.
+    mov [rel dbg_ts], rax
+    lea rdi, [rel hdr_test_type]
+    mov rsi, 1
+    call le_n
+    mov [rel dbg_le], rax
     movzx rax, byte [rel hdr_test_type]
-    cmp al, MB_EV_FORMAT_DESC
-    jne selftest_fail
+    mov [rel dbg_movzx], rax
     lea rdi, [rel hdr_test + 9]
     mov rsi, 4
     call le_n
+    mov [rel dbg_es], rax
+    lea rdi, [rel f_dbg]
+    mov rsi, [rel dbg_crc]
+    mov rdx, [rel dbg_ts]
+    mov rcx, [rel dbg_le]
+    mov r8, [rel dbg_movzx]
+    mov r9, [rel dbg_es]
+    xor eax, eax
+    call printf_plt
+    mov rax, [rel dbg_crc]
+    cmp eax, MB_CRC32_VECTOR
+    jne selftest_fail
+    mov rax, [rel dbg_ts]
+    cmp rax, 1700000000
+    jne selftest_fail
+    mov rax, [rel dbg_le]
+    cmp al, MB_EV_FORMAT_DESC
+    jne selftest_fail
+    mov rax, [rel dbg_movzx]
+    cmp al, MB_EV_FORMAT_DESC
+    jne selftest_fail
+    mov rax, [rel dbg_es]
     cmp rax, 119
     jne selftest_fail
     PLIT lit_st_ok
@@ -1030,6 +1052,8 @@ f_qstr:
     db(FMT_QSTR, 0)
 f_num:
     db(FMT_NUM, 0)
+f_dbg:
+    db(FMT_DBG, MB_NEWLINE, 0)
 
 f_comma:
     db(LIT_COMMA, 0)
@@ -1225,6 +1249,16 @@ r_nullbm:
 r_slen:
     rq(1)
 typename:
+    rq(1)
+dbg_crc:
+    rq(1)
+dbg_ts:
+    rq(1)
+dbg_le:
+    rq(1)
+dbg_movzx:
+    rq(1)
+dbg_es:
     rq(1)
 
 format_segment_end(image, ".bss")
