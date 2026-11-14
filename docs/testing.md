@@ -33,8 +33,9 @@
 | python | `python3 -m unittest discover`（含 golden） | Python 3 |
 | asm | `./mysqlbinlog-asm --self-test`（CRC 向量 + header 字段） | nasm + gcc -no-pie |
 
-Rust / Go / Java / C# / Zig / Erlang / Python 的单测内部还各做一次 golden 比对；
-C / C++ / asm 的端到端一致性由 CI 的 `diff -u expected.jsonl out.jsonl` 保证。
+Rust / Go / Java / C# / Erlang / Python 的单测内部还各做一次 golden 比对；
+C / C++ / Zig / asm 的端到端一致性由 CI 的 `diff -u expected.jsonl out.jsonl` 保证
+（Zig 0.13 的 `@embedFile` 不允许跨出模块包根，因此不在单测里嵌入 fixtures）。
 
 ## 3. Golden Test（核心）
 

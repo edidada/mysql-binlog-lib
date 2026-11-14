@@ -103,7 +103,7 @@ path             resq 1
 fp               resq 1
 inlen            resq 1
 pos              resq 1
-es               resq 1
+ev_size          resq 1
 etype            resq 1
 stamps           resq 1
 body             resq 1
@@ -360,22 +360,22 @@ ev_loop:
     lea rdi, [r12 + 9]
     mov rsi, 4
     call le_n
-    mov [rel es], rax
-    cmp qword [rel es], 23
+    mov [rel ev_size], rax
+    cmp qword [rel ev_size], 23
     jb truncated
     mov rax, [rel pos]
-    add rax, [rel es]
+    add rax, [rel ev_size]
     cmp rax, [rel inlen]
     ja truncated
 
     ; CRC32 over header+body (event_size-4 bytes)
     mov rdi, r12
-    mov rsi, [rel es]
+    mov rsi, [rel ev_size]
     sub rsi, 4
     call crc32
     mov dword [rel calccrc], eax
     mov rdi, r12
-    add rdi, [rel es]
+    add rdi, [rel ev_size]
     sub rdi, 4
     mov rsi, 4
     call le_n
@@ -395,7 +395,7 @@ ev_loop:
     lea rax, [r12 + 19]
     mov [rel body], rax
     mov [rel cur], rax
-    mov rax, [rel es]
+    mov rax, [rel ev_size]
     sub rax, 23
     mov [rel blen], rax
     mov [rel brem], rax
@@ -896,14 +896,14 @@ h_unknown:
     lea rdi, [rel f_unknown]
     mov rsi, [rel stamps]
     mov rdx, [rel etype]
-    mov rcx, [rel es]
+    mov rcx, [rel ev_size]
     xor eax, eax
     call printf wrt ..plt
     jmp next_event
 
 next_event:
     mov rax, [rel pos]
-    add rax, [rel es]
+    add rax, [rel ev_size]
     mov [rel pos], rax
     jmp ev_loop
 

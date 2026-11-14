@@ -432,11 +432,7 @@ test "bad magic" {
     try std.testing.expectError(error.Invalid, parseBuffer(std.testing.allocator, &[_]u8{ 0, 0, 0, 0 }));
 }
 
-test "golden fixture" {
-    const alloc = std.testing.allocator;
-    const data = @embedFile("../../fixtures/demo.bin");
-    const expected = @embedFile("../../fixtures/expected.jsonl");
-    const got = try parseBuffer(alloc, data);
-    defer alloc.free(got);
-    try std.testing.expectEqualStrings(expected, got);
-}
+// End-to-end golden verification for Zig is performed by the CI step
+// `diff -u fixtures/expected.jsonl out.jsonl` (same as C / C++ / asm).
+// Zig 0.13 forbids @embedFile outside the module package root, so the
+// fixture is not embedded here.

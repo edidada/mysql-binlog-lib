@@ -150,7 +150,7 @@ emit(Type, T, Size, Body, Reg) ->
     case Type of
         15 -> % FORMAT_DESCRIPTION_EVENT
             {BV, R1} = rd_le(R0, 2),
-            {Tmp, R2} = rd_raw(R1, 50),
+            {Tmp, _R2} = rd_raw(R1, 50),
             SV = hd(binary:split(Tmp, <<0>>)),
             Alg = binary:last(Body),
             Line = [<<"{\"type\":\"FORMAT_DESCRIPTION_EVENT\",\"timestamp\":">>, num(T),
@@ -162,7 +162,7 @@ emit(Type, T, Size, Body, Reg) ->
         33 -> % GTID_LOG_EVENT
             {_, R1} = rd_le(R0, 1),
             {Sid, R2} = rd_raw(R1, 16),
-            {Gno, R3} = rd_le(R2, 8),
+            {Gno, _R3} = rd_le(R2, 8),
             Hex = list_to_binary([hex_pair(B) || B <- binary:bin_to_list(Sid)]),
             Line = [<<"{\"type\":\"GTID_LOG_EVENT\",\"timestamp\":">>, num(T),
                     <<",\"gno\":">>, num(Gno),
@@ -208,7 +208,7 @@ emit(Type, T, Size, Body, Reg) ->
             Vlen = parse_metadata(TypeList, R11),
             R12 = R11#{pos := MdStart + MdLen},
             Nb = (Cc + 7) div 8,
-            {NullBm, R13} = rd_le(R12, Nb),
+            {NullBm, _R13} = rd_le(R12, Nb),
             Nullable = length([I || I <- lists:seq(0, Cc - 1),
                                     (NullBm band (1 bsl I)) =/= 0]),
             S = #{db => Db, table => Tb, cc => Cc, types => TypeList,
@@ -315,7 +315,7 @@ parse_row(R0, I, Cc, P1, NullBm, Types, Vlen, Acc, First) ->
                         end
                 end,
             parse_row(R1, I + 1, Cc, P1, NullBm, Types, Vlen,
-                      [Sep, ValIo | Acc], false)
+                      [ValIo, Sep | Acc], false)
     end.
 
 parse_metadata([], _R) -> [];
