@@ -182,7 +182,11 @@ jobs:
         if: matrix.lang == 'asm'
         run: |
           set -e
-          .xirasm/xirasm asm/main.xir --isa x86-64 -o asm/mysqlbinlog-asm
+          .xirasm/xirasm asm/main.xir --isa x86-64 -o asm/mysqlbinlog-asm --listing asm/main.lst
+          echo "--- listing head ---"
+          sed -n '1,40p' asm/main.lst || true
+          echo "--- listing code rows ---"
+          grep -c 'code' asm/main.lst || true
           chmod +x asm/mysqlbinlog-asm
           ./asm/mysqlbinlog-asm --self-test
           ./asm/mysqlbinlog-asm --file fixtures/demo.bin --format jsonl > out.jsonl
