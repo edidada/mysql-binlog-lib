@@ -791,7 +791,7 @@ rows_rowloop:
     mov [rel r_nullbm], rax
     PLIT f_lbrack
     xor r14, r14                   ; column index i (callee-saved)
-    mov r15, 1                     ; first flag
+    xor r15, r15                   ; 0 = no comma needed yet, 1 = comma before next value
 rows_collow:
     mov rax, [rel schema_cc]
     cmp r14, rax
@@ -803,7 +803,7 @@ rows_collow:
     je rows_nocomma
     PLIT f_comma
 rows_nocomma:
-    mov r15, 0
+    mov r15, 1
     mov rax, [rel r_nullbm]
     bt rax, r14
     jc rows_nullval

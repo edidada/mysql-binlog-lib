@@ -28,7 +28,7 @@
 | go | `go test ./...` (`testing`，含 golden) | Go 1.23 |
 | java | `java -cp out mysqlbinlog.ParserTest`（自建断言，含 golden） | JDK 21 `javac` |
 | csharp | `dotnet <Tests>.dll`（自建断言，含 golden） | .NET 8 |
-| zig | `zig build test`（`test` 块，含 `@embedFile` golden） | Zig 0.13.0 |
+| zig | `zig build test`（`test` 块；golden 由 CI diff 保证） | Zig 0.13.0 |
 | erlang | `eunit:test/2`（含 golden） | OTP `erlc` / `erl` |
 | python | `python3 -m unittest discover`（含 golden） | Python 3 |
 | asm | `./mysqlbinlog-asm --self-test`（CRC 向量 + header 字段） | nasm + gcc -no-pie |
