@@ -331,6 +331,20 @@ public:
 
 // === [6] EventParser ===
 // Header decoding, framing, and one named handler per event kind.
+
+// Decode a single 19-byte little-endian event header (public API).
+Status parse_header(const uint8_t* data, size_t size, EventHeader& h) {
+    if (!data || size < kHeaderSize) return Status::Truncated;
+    ByteReader r(data, size);
+    h.timestamp     = static_cast<uint32_t>(r.le(4));
+    h.event_type    = static_cast<uint8_t>(r.le(1));
+    h.server_id     = static_cast<uint32_t>(r.le(4));
+    h.event_size    = static_cast<uint32_t>(r.le(4));
+    h.next_position = static_cast<uint32_t>(r.le(4));
+    h.flags         = static_cast<uint16_t>(r.le(2));
+    return r.error() ? Status::Truncated : Status::Ok;
+}
+
 namespace {
 const char* rows_name(uint8_t t) {
     if (t == kEvWriteRowsV2)  return "WRITE_ROWS_EVENT_V2";
@@ -595,19 +609,6 @@ private:
     SchemaRegistry reg_;
 };
 } // namespace
-
-// Decode a single 19-byte little-endian event header (public API).
-Status parse_header(const uint8_t* data, size_t size, EventHeader& h) {
-    if (!data || size < kHeaderSize) return Status::Truncated;
-    ByteReader r(data, size);
-    h.timestamp     = static_cast<uint32_t>(r.le(4));
-    h.event_type    = static_cast<uint8_t>(r.le(1));
-    h.server_id     = static_cast<uint32_t>(r.le(4));
-    h.event_size    = static_cast<uint32_t>(r.le(4));
-    h.next_position = static_cast<uint32_t>(r.le(4));
-    h.flags         = static_cast<uint16_t>(r.le(2));
-    return r.error() ? Status::Truncated : Status::Ok;
-}
 
 // === [7] Public API ===
 // Whole-buffer parser: verify magic, frame/verify each event, dispatch, emit.
