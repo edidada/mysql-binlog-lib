@@ -7,17 +7,18 @@
 //   ./asm/mysqlbinlog-asm --self-test
 //   ./asm/mysqlbinlog-asm --file fixtures/demo.bin --format jsonl
 //
-// The compile-time layer mirrors the C implementation's structure
-// (c/src/mysqlbinlog.c), so the ten-language matrix stays comparable:
+// The compile-time layer mirrors the C implementation's seven-layer structure
+// (c/src/mysqlbinlog.c, docs/design.md section 4), so the ten-language matrix
+// stays comparable. Layer [0] holds named protocol constants; [8] is the
+// asm-specific ELF entry/CLI/self-test shell around the shared public API.
 //
-//   [1] Protocol constants      named consts instead of magic numbers
-//   [2] ByteReader             one shared le_n leaf routine
-//   [3] CRC-32                 leaf routine
+//   [1] ByteReader             one shared le_n leaf routine
+//   [2] CRC-32                 leaf routine
+//   [3] Serializer             printf format strings (fixed key order)
 //   [4] SchemaRegistry         .bss state + named offsets
 //   [5] RowDecoder             rows loop
 //   [6] EventParser            per-event handlers, dispatch table
-//   [7] Serializer             printf format strings (fixed key order)
-//   [8] CLI + self-test        argument scan, exits
+//   [7] Public API             framing/CRC32/dispatch -> one JSONL line each
 //
 // XIRASM's fn/for/if run at ASSEMBLY time. The parser's runtime logic is
 // therefore still handwritten x86-64; the C-like constructs generate its
@@ -37,7 +38,7 @@ import("format/format.inc")
 x86.use64()
 
 // ==========================================================================
-// [1] Protocol constants (docs/design.md sections 2-3). All C-like names.
+// [0] Protocol constants (docs/design.md sections 2-3). All C-like names.
 // ==========================================================================
 const MB_HEADER_SIZE:        u64 = 19
 const MB_CRC_SIZE:           u64 = 4
@@ -81,7 +82,7 @@ packed struct MbEventHeader {
 assert(sizeof(MbEventHeader) == MB_HEADER_SIZE)
 
 // ==========================================================================
-// [7] Serializer: canonical JSONL printf formats (fixed key order, no spaces).
+// [3] Serializer: canonical JSONL printf formats (fixed key order, no spaces).
 // ==========================================================================
 const FMT_FDE:       string = '{"type":"FORMAT_DESCRIPTION_EVENT","timestamp":%llu,"binlog_version":%llu,"server_version":"%.*s","checksum_alg":%llu}'
 const FMT_UNKNOWN:   string = '{"type":"UNKNOWN","timestamp":%llu,"type_id":%llu,"event_size":%llu}'
@@ -144,7 +145,7 @@ format_elfexe_tables_mut(image, imports)
 format_begin(image)
 
 // ==========================================================================
-// [2] ByteReader helper macro. `macro` substitutes the captured operand into
+// [3] Serializer helper macro. `macro` substitutes the captured operand into
 // an instruction position and emits ONE shared leaf routine below (no private
 // labels inside the macro, which XIRASM would treat as module labels).
 //
@@ -157,7 +158,7 @@ macro PLIT(label) {
 }
 
 // ==========================================================================
-// [2]/[3] ByteReader / CRC-32 / [5] RowDecoder / [6] EventParser / [8] CLI.
+// [1]/[2] ByteReader / CRC-32 plus [5] RowDecoder / [6] EventParser / [8] CLI.
 // Leaf helpers never call libc, so stack alignment is irrelevant; the shared
 // le_n loop is one function rather than an inlined macro. Emitted first:
 // a dynamic ELF requires its row-0 LOAD segment to open first.
@@ -1000,7 +1001,7 @@ done_ok:
 format_segment_end(image, ".text")
 
 // ==========================================================================
-// [7] Serializer: format strings, literals, self-test vectors.
+// [3] Serializer: format strings, literals, self-test vectors.
 // Each db call appends the trailing newline and NUL terminator explicitly;
 // XIRASM does not add a terminator automatically.
 // ==========================================================================
