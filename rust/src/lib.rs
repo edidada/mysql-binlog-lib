@@ -800,7 +800,8 @@ mod tests {
         let mut raw = build_event(99, None, &[]);
         put_le(&mut raw[4 + 9..4 + 13], 10, 4);
         let c = crc32(&raw[4..raw.len() - 4]);
-        raw[raw.len() - 4..].copy_from_slice(&c.to_le_bytes());
+        let tail = raw.len() - 4;
+        raw[tail..].copy_from_slice(&c.to_le_bytes());
         assert_eq!(parse_buffer(&raw), Err(Error::Truncated));
     }
 
@@ -809,7 +810,8 @@ mod tests {
         let mut raw = build_event(99, None, &[]);
         put_le(&mut raw[4 + 9..4 + 13], 0xFFFF_FFFF, 4);
         let c = crc32(&raw[4..raw.len() - 4]);
-        raw[raw.len() - 4..].copy_from_slice(&c.to_le_bytes());
+        let tail = raw.len() - 4;
+        raw[tail..].copy_from_slice(&c.to_le_bytes());
         assert_eq!(parse_buffer(&raw), Err(Error::Truncated));
     }
 

@@ -68,7 +68,7 @@ namespace MysqlBinlog.Tests
             Check(hd.NextPosition == 123, "nextPosition");
             Check(hd.Flags == 0, "flags");
 
-            ExpectError("truncated", new byte[10], "truncated header (via buffer)");
+            ExpectError("invalid", new byte[10], "short buffer with bad magic");
             try { Parser.ParseHeader(new byte[10]); Check(false, "truncated header should throw"); }
             catch (BinlogException e) { Check(e.Code == "truncated", "truncated code"); }
 
