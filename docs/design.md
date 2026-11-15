@@ -191,24 +191,36 @@ ROTATE: 8 字节 u64 LE position + 剩余字节 next_file（字符串）
 
 ## 4. 模块划分与状态机
 
-十语言统一采用 `Parser + Reader + SchemaRegistry + Serializer` 模型：
+十语言统一采用同一套**七层结构**（以 `c/src/mysqlbinlog.c` 为参考实现，各语言用本语言惯用写法表达同样的层次与顺序）：
+
+| 层 | 职责 |
+| --- | --- |
+| `[1] ByteReader` | 有边界检查的小端原语；`error` 标志锁存；`lenenc` 拒绝 `0xFB`/`0xFF` |
+| `[2] CRC-32` | IEEE / zlib 校验（`crc32("123456789") == 0xCBF43926`） |
+| `[3] Serializer` | 有界 canonical JSONL 构造器；固定键序、无空格、最小转义、溢出标志 |
+| `[4] SchemaRegistry` | `table_id → TableSchema`，每文件生命周期，`put` 覆盖 / `get` 缺失返回空 |
+| `[5] RowDecoder` | 依 schema 解码 `decode_value` + `decode_rows`，限制 VARCHAR 长度与位图大小 |
+| `[6] EventParser` | 头解析、帧校验、按事件类型分发到各命名 handler（UNKNOWN 稳定跳过） |
+| `[7] Public API` | `parse_buffer`：magic → header → event_size 上下界 → CRC32 → dispatch → 逐行输出 |
 
 ```
 read_file
   └─ verify magic
       └─ loop events:
            read header(19) -> event_size
-           read full event -> verify CRC32
+           event_size 上下界 / 上限校验
+           read full event -> verify CRC32(header+body)
            body = event[19 : size-4]
            dispatch(type):
              FDE        -> record checksum_alg
-             TABLE_MAP  -> schema.register(table_id, ...)
-             ROWS_V2    -> schema.lookup(table_id) -> decode rows
+             TABLE_MAP  -> schema.put(table_id, ...)
+             ROWS_V2    -> schema.get(table_id) -> decode rows
              others     -> decode fields / skip
            emit one canonical JSONL line
 ```
 
 - **SchemaRegistry**：`table_id → TableSchema`，生命周期覆盖整个文件；RowsEvent 解码前必须查到对应 Table Map，否则报错。
+- **防御性约束**：所有读取做边界检查；列数 `≤ 64`、表数 `≤ 64`、单事件 `≤ 256 MiB`、单行 `≤ 16 KiB`；字符串按有界缓冲复制，不做无界 `strcpy`。
 - **错误码**：`OK / INVALID / TRUNCATED / UNSUPPORTED / CHECKSUM / NO_SCHEMA`。越界即 `TRUNCATED`，CRC 不符即 `CHECKSUM`。
 
 ## 5. 统一 JSONL 输出规范（Canonical JSONL）
@@ -250,7 +262,7 @@ UNKNOWN                  : type,timestamp,type_id,event_size
 
 ## 7. 各语言工程结构
 
-十语言互不使用 FFI，各自独立实现同一套 `Parser + Reader + SchemaRegistry + Serializer` 模型。
+十语言互不使用 FFI，各自独立实现同一套七层模型（见 §4：ByteReader / CRC-32 / Serializer / SchemaRegistry / RowDecoder / EventParser / Public API），层次顺序与命名与 `c/src/mysqlbinlog.c` 对齐。
 
 ```
 c/       CMakeLists.txt, include/mysqlbinlog.h, src/mysqlbinlog.c,
@@ -271,14 +283,12 @@ python/  mysqlbinlog.py, mysqlbinlog_cli.py, test_parser.py (标准库 unittest)
 asm/     main.xir                                    (XIRASM 0.3.5, x86-64 ELF64)
 ```
 
-| 语言 | CRC32 实现 | 单测载体 | 备注 |
-| --- | --- | --- | --- |
-| C / C++ / Java / C# / Zig / Erlang / asm / Python | 手写位运算（IEEE） | 各自 runner | 与 zlib 标准向量一致 |
-| Go | 标准库 `hash/crc32.ChecksumIEEE` | `go test` | 与 zlib 一致 |
-| Rust | 手写位运算 | `#[cfg(test)]` | 零外部 crate |
+| 语言 | CRC32 / Serializer | 单测载体 |
+| --- | --- | --- |
+| 全部十语言 | 独立的 `[2] CRC-32` 层（IEEE 位运算，标准向量 `0xCBF43926`）+ 独立的 `[3] Serializer` 层（有界缓冲、固定键序、最小转义） | CTest / `cargo test` / `go test` / 自建断言 / `zig build test` / EUnit / `unittest` / `--self-test` |
 
 - 依赖策略：**全部零第三方库依赖**，避免 CI 拉取网络依赖导致不稳定。工具链本身由 CI 的 setup action / apt 安装（见 ops-sop.md §1），不算库依赖。
-- Python 用 `json.dumps(..., separators=(',',':'))` + 保序 dict 生成 canonical JSONL；其余语言手写 serializer，保证键序一致。
+- 十语言统一手写 `[3] Serializer`：不用各语言自带的 `json.dumps` / `JsonSerializer`，以保证键序、空格、转义规则逐字节一致。
 - 汇编版 (xirasm) 由 `format.inc` 直接生成 ELF64 可执行文件，libc 调用走自动生成的 PLT 导入（`*_plt` 标签），用 `printf` 输出；字符串依赖受控子集「纯 ASCII 无特殊字符」的约束（`%.*s` 不做 JSON 转义）；其余九语言实现完整转义。源码用 XIRASM 的编译期语言（`const`/`struct`/`packed struct`/`assert`/`macro`/`format_*`）组织为与 C 版一致的 ByteReader / EventParser / SchemaRegistry / RowDecoder / Serializer 分层；运行时解析逻辑仍是手写 x86-64 指令。
 - 构建与验证统一由 `.github/workflows/ci.yml` 完成；**本地不编译**（见 ops-sop.md §2）。
 

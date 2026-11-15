@@ -68,6 +68,22 @@ mysqlbinlog-go --file fixtures/demo.bin --format jsonl
 
 十种语言的 stdout 都必须与 `fixtures/expected.jsonl` **逐字节一致**。
 
+## 统一分层（十语言对齐）
+
+十份实现都不通过 FFI 互调，但内部按**同一套七层结构**组织，顺序与命名以 `c/src/mysqlbinlog.c` 为参考：
+
+| 层 | 职责 |
+| --- | --- |
+| `[1] ByteReader` | 有边界检查的小端原语（lenenc 拒绝 `0xFB`/`0xFF`），错误标志锁存 |
+| `[2] CRC-32` | IEEE / zlib 校验，标准向量 `0xCBF43926` |
+| `[3] Serializer` | 有界 canonical JSONL 构造器：固定键序、无空格、最小转义 |
+| `[4] SchemaRegistry` | `table_id → TableSchema`，每文件生命周期 |
+| `[5] RowDecoder` | `decode_value` + `decode_rows`，依 schema 解码行值 |
+| `[6] EventParser` | 帧校验 + 按事件类型分发到各命名 handler |
+| `[7] Public API` | `parse_buffer`：magic → header → CRC32 → dispatch → 逐行输出 |
+
+各语言用本语言惯用写法（C `struct` + `static`、Rust `struct`/`Result`、Go `struct`/`error`、Java/C# 类、Zig `struct`/error union、Erlang record + 元组、Python 类、XIRASM 编译期 `const`/`packed struct`/`macro` + 手写 x86-64）表达同样的层次。详见 [docs/design.md](docs/design.md) §4。
+
 ## 构建与验证
 
 **本地不编译**。所有编译、运行、单测、golden 比对都在 GitHub Actions 完成：

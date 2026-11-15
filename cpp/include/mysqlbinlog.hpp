@@ -8,6 +8,14 @@
 
 namespace mysqlbinlog {
 
+/*
+ * Phase 1 offline parser (see docs/design.md). The public API below and the
+ * canonical JSONL emitted by parse_buffer are a cross-language contract: the
+ * other language implementations and fixtures/expected.jsonl rely on them.
+ * Internals are layered as ByteReader / CRC32 / Serializer / SchemaRegistry /
+ * RowDecoder / EventParser inside src/mysqlbinlog.cpp.
+ */
+
 enum class Status {
     Ok = 0,
     Invalid = -1,
