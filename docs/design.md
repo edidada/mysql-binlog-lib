@@ -54,7 +54,7 @@ FE 62 69 6E        # \xfe b i n
              event_size = 19 + N + 4
 ```
 
-- `CRC32` = 标准 CRC-32（IEEE 802.3，多项式 `0xEDB88320`，初值 `0xFFFFFFFF`，末异或 `0xFFFFFFFF`，等价 zlib `crc32` / Go `crc32.ChecksumIEEE`），覆盖 `header + body`（即 `event[0 : event_size-4]`），以 **u32 小端**存放。
+- `CRC32` = 标准 CRC-32（IEEE 802.3，多项式 `0xEDB88320`，初值 `0xFFFFFFFF`，末异或 `0xFFFFFFFF`，等价 zlib `crc32`；十语言均在自己的 `[2] CRC-32` 层手写位运算，不调用标准库实现），覆盖 `header + body`（即 `event[0 : event_size-4]`），以 **u32 小端**存放。
 - 解析流程：读 19 字节头 → 得 `event_size` → 读完整个事件 `event[0:event_size]` → 校验 `crc32(event[0:event_size-4]) == u32le(event[event_size-4:])` → 取 `body = event[19 : event_size-4]` → 按 `event_type` 分派。
 - 任一步越界或 CRC 不符 → 该语言 CLI 以**非零码退出**（CI 据此判定失败）。
 
@@ -289,7 +289,7 @@ asm/     main.xir                                    (XIRASM 0.3.5, x86-64 ELF64
 
 - 依赖策略：**全部零第三方库依赖**，避免 CI 拉取网络依赖导致不稳定。工具链本身由 CI 的 setup action / apt 安装（见 ops-sop.md §1），不算库依赖。
 - 十语言统一手写 `[3] Serializer`：不用各语言自带的 `json.dumps` / `JsonSerializer`，以保证键序、空格、转义规则逐字节一致。
-- 汇编版 (xirasm) 由 `format.inc` 直接生成 ELF64 可执行文件，libc 调用走自动生成的 PLT 导入（`*_plt` 标签），用 `printf` 输出；字符串依赖受控子集「纯 ASCII 无特殊字符」的约束（`%.*s` 不做 JSON 转义）；其余九语言实现完整转义。源码用 XIRASM 的编译期语言（`const`/`struct`/`packed struct`/`assert`/`macro`/`format_*`）组织为与 C 版一致的 ByteReader / EventParser / SchemaRegistry / RowDecoder / Serializer 分层；运行时解析逻辑仍是手写 x86-64 指令。
+- 汇编版 (xirasm) 由 `format.inc` 直接生成 ELF64 可执行文件，libc 调用走自动生成的 PLT 导入（`*_plt` 标签），用 `printf` 输出；字符串依赖受控子集「纯 ASCII 无特殊字符」的约束（`%.*s` 不做 JSON 转义）；其余九语言实现完整转义。源码用 XIRASM 的编译期语言（`const`/`struct`/`packed struct`/`assert`/`macro`/`format_*`）按 §4 的七层顺序组织（另加 `[0]` 常量与 `[8]` ELF/CLI 外壳）；运行时解析逻辑仍是手写 x86-64 指令。
 - 构建与验证统一由 `.github/workflows/ci.yml` 完成；**本地不编译**（见 ops-sop.md §2）。
 
 ## 8. 与后续阶段的边界
