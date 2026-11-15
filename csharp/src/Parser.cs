@@ -1,3 +1,22 @@
+/*
+ * Phase 1 offline MySQL binlog parser (C# / .NET, no NuGet dependencies).
+ *
+ * CONTRACT: the public API in this file (ParseBuffer, ParseHeader, Crc32,
+ * EventHeader, BinlogException) and the canonical JSONL emitted by
+ * ParseBuffer are a cross-language contract: the other nine implementations,
+ * fixtures/expected.jsonl and the CLI all rely on them. Do not change either
+ * without a cross-language update.
+ *
+ * Layered structure (mirrors c/src/mysqlbinlog.c and docs/design.md section 4):
+ *
+ *   [1] ByteReader     bounds-checked little-endian primitives
+ *   [2] CRC-32         IEEE / zlib checksum
+ *   [3] Serializer     canonical JSONL builder (fixed key order, no spaces)
+ *   [4] SchemaRegistry table_id -> TableSchema
+ *   [5] RowDecoder     decode RowsEventV2 rows using a registered schema
+ *   [6] EventParser    frame/verify/dispatch events -> one JSONL line each
+ *   [7] Public API     ParseHeader / Crc32 / ParseBuffer
+ */
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -20,66 +39,139 @@ namespace MysqlBinlog
         public ushort Flags;
     }
 
-    /// <summary>Phase 1 offline MySQL binlog parser (.NET only, no NuGet deps).</summary>
     public static class Parser
     {
-        private sealed class Reader
+        /* ================================================================== */
+        /* [0] Protocol constants (docs/design.md sections 2-3).             */
+        /* ================================================================== */
+        private const int HeaderSize = 19;
+        private const int CrcSize = 4;
+        private const int MagicSize = 4;
+        private const int MaxCols = 64;
+        private const int MaxTables = 64;
+        private const long MaxEventSize = 256L * 1024 * 1024; // corrupt-size guard
+        private const int LineCap = 16384;                     // max single JSONL line
+        private const int StrCap = 2048;                      // max query / next_file
+        private const int ValueCap = 512;                     // max VARCHAR value
+        private const int NameCap = 128;                      // max db / table name
+        private const int ServerVersionLen = 50;
+
+        private const int TypeLong = 3;
+        private const int TypeLonglong = 8;
+        private const int TypeVarchar = 15;
+
+        private const int EvQuery = 2;
+        private const int EvRotate = 4;
+        private const int EvFormatDesc = 15;
+        private const int EvXid = 16;
+        private const int EvTableMap = 19;
+        private const int EvRowsQuery = 29;
+        private const int EvWriteRowsV2 = 30;
+        private const int EvUpdateRowsV2 = 31;
+        private const int EvDeleteRowsV2 = 32;
+        private const int EvGtid = 33;
+
+        private static readonly byte[] Magic = { 0xFE, (byte)'b', (byte)'i', (byte)'n' };
+        private const string Hex = "0123456789abcdef";
+
+        /* ================================================================== */
+        /* [1] ByteReader: every read is bounds-checked; Error latches.      */
+        /* ================================================================== */
+        private sealed class ByteReader
         {
-            public readonly byte[] D;
-            public int Pos;
-            public Reader(byte[] d) { D = d; }
-            public int Rem() { return D.Length - Pos; }
+            private readonly byte[] d;
+            private readonly int len;
+            private int pos;
+            public string Error; // first failure code, latched
+
+            public ByteReader(byte[] data, int start, int length)
+            {
+                d = data;
+                len = start + length;
+                pos = start;
+                if (len > data.Length) Error = "truncated";
+            }
+
+            public int Pos { get { return pos; } set { pos = value; } }
+            public int Len { get { return len; } }
+
+            public int Rem() { return pos <= len ? len - pos : 0; }
+
+            /// <summary>Overflow-safe "pos + n &lt;= len" test.</summary>
+            public bool Can(int n)
+            {
+                return Error == null && n >= 0 && n <= len && pos <= len - n;
+            }
+
+            private void Fail(string code)
+            {
+                if (Error == null) Error = code;
+            }
+
             public ulong Le(int n)
             {
-                if (n < 0 || n > 8 || Pos + n > D.Length) throw new BinlogException("truncated");
+                if (n > 8 || !Can(n)) { Fail("truncated"); return 0; }
                 ulong v = 0;
-                for (int i = 0; i < n; i++) v |= ((ulong)D[Pos + i]) << (8 * i);
-                Pos += n;
+                for (int i = 0; i < n; i++) v |= ((ulong)d[pos + i]) << (8 * i);
+                pos += n;
                 return v;
             }
+
             public byte[] Raw(int n)
             {
-                if (n < 0 || Pos + n > D.Length) throw new BinlogException("truncated");
+                if (!Can(n)) { Fail("truncated"); return new byte[0]; }
                 var b = new byte[n];
-                Array.Copy(D, Pos, b, 0, n);
-                Pos += n;
+                Array.Copy(d, pos, b, 0, n);
+                pos += n;
                 return b;
             }
-            public string Text(int n) { return Encoding.UTF8.GetString(Raw(n)); }
+
+            /// <summary>Read exactly n bytes as a bounded UTF-8 string, but always
+            /// advance by n so framing stays aligned (mirrors rd_strn in C).</summary>
+            public string Strn(int n, int cap)
+            {
+                if (cap == 0) return string.Empty;
+                if (!Can(n)) { Fail("truncated"); return string.Empty; }
+                int m = Math.Min(n, cap - 1);
+                string s = Encoding.UTF8.GetString(d, pos, m);
+                pos += n;
+                return s;
+            }
+
             public void Skip(int n)
             {
-                if (n < 0 || Pos + n > D.Length) throw new BinlogException("truncated");
-                Pos += n;
+                if (!Can(n)) { Fail("truncated"); return; }
+                pos += n;
             }
+
+            /// <summary>MySQL length-encoded integer. 0xFB (NULL) and 0xFF
+            /// (reserved) are not valid lengths where a length is required.</summary>
             public ulong Lenenc()
             {
                 ulong b = Le(1);
+                if (Error != null) return 0;
                 if (b < 0xFB) return b;
-                if (b == 0xFB) return 0;
                 if (b == 0xFC) return Le(2);
                 if (b == 0xFD) return Le(3);
                 if (b == 0xFE) return Le(8);
+                Fail("unsupported");
                 return 0;
             }
+
+            public byte LastByte() { return d[len - 1]; }
         }
 
-        private sealed class Schema
-        {
-            public ulong TableId;
-            public string Db, Table;
-            public int Cc;
-            public int[] Types, Vlen;
-            public int Nullable;
-        }
-
-        private static ulong Le(byte[] d, int off, int n)
+        private static ulong PeekLe(byte[] p, int off, int n)
         {
             ulong v = 0;
-            for (int i = 0; i < n; i++) v |= ((ulong)d[off + i]) << (8 * i);
+            for (int i = 0; i < n; i++) v |= ((ulong)p[off + i]) << (8 * i);
             return v;
         }
 
-        /// <summary>CRC-32 (IEEE / zlib), implemented bitwise.</summary>
+        /* ================================================================== */
+        /* [2] CRC-32 (IEEE 802.3 / zlib).                                    */
+        /* Vector: Crc32("123456789") == 0xCBF43926.                         */
+        /* ================================================================== */
         public static uint Crc32(byte[] d, int off, int len)
         {
             uint crc = 0xFFFFFFFF;
@@ -95,10 +187,163 @@ namespace MysqlBinlog
             return ~crc;
         }
 
+        /* ================================================================== */
+        /* [3] Serializer: bounded canonical JSONL builder.                  */
+        /* ================================================================== */
+        private sealed class Serializer
+        {
+            private readonly StringBuilder sb = new StringBuilder();
+            private readonly int cap;
+            public bool Overflow;
+
+            public Serializer(int cap) { this.cap = cap; }
+
+            private void Append(string s)
+            {
+                if (Overflow) return;
+                if (sb.Length + s.Length > cap) { Overflow = true; return; }
+                sb.Append(s);
+            }
+
+            public void Putc(char c) { Append(c.ToString()); }
+            public void Puts(string s) { Append(s); }
+            // A single object overload avoids ambiguous long/ulong conversions
+            // for uint/int call sites; integers render culture-invariantly.
+            public void UInt(object v)
+            {
+                Append(Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            /// <summary>Minimal JSON escaping: quotes, backslash, controls.</summary>
+            public void JsonStr(string s)
+            {
+                Putc('"');
+                foreach (char c in s)
+                {
+                    switch (c)
+                    {
+                        case '"': Puts("\\\""); break;
+                        case '\\': Puts("\\\\"); break;
+                        case '\n': Puts("\\n"); break;
+                        case '\r': Puts("\\r"); break;
+                        case '\t': Puts("\\t"); break;
+                        default:
+                            if (c < 0x20) Puts("\\u" + ((int)c).ToString("x4"));
+                            else Putc(c);
+                            break;
+                    }
+                }
+                Putc('"');
+            }
+
+            public string Line() { return sb.ToString(); }
+        }
+
+        private static bool Bit(ulong v, int i) { return (v & (1UL << i)) != 0; }
+
+        /* ================================================================== */
+        /* [4] SchemaRegistry: table_id -> TableSchema, per-file lifetime.   */
+        /* ================================================================== */
+        private sealed class TableSchema
+        {
+            public ulong TableId;
+            public string Db, Table;
+            public int ColumnCount;
+            public int[] ColumnTypes, VarcharLenBytes;
+            public int NullableCount;
+        }
+
+        private sealed class SchemaRegistry
+        {
+            private readonly List<TableSchema> v = new List<TableSchema>();
+
+            public void Put(TableSchema s) // replace existing, or add under cap
+            {
+                for (int i = 0; i < v.Count; i++)
+                {
+                    if (v[i].TableId == s.TableId) { v[i] = s; return; }
+                }
+                if (v.Count < MaxTables) v.Add(s);
+            }
+
+            public TableSchema Get(ulong id)
+            {
+                foreach (var s in v) if (s.TableId == id) return s;
+                return null;
+            }
+        }
+
+        /* ================================================================== */
+        /* [5] RowDecoder: decode a row sequence against a TableSchema.      */
+        /* ================================================================== */
+        private static void Require(ByteReader r)
+        {
+            if (r.Error != null) throw new BinlogException(r.Error);
+        }
+
+        private static void DecodeValue(ByteReader r, TableSchema s, int col,
+                                        bool isNull, Serializer b)
+        {
+            if (isNull) { b.Puts("null"); return; }
+            switch (s.ColumnTypes[col])
+            {
+                case TypeLonglong:
+                    b.UInt(unchecked((long)r.Le(8)));
+                    break;
+                case TypeLong:
+                    b.UInt(unchecked((int)(uint)r.Le(4)));
+                    break;
+                case TypeVarchar:
+                    {
+                        int lb = s.VarcharLenBytes[col];
+                        if (lb != 1 && lb != 2) throw new BinlogException("unsupported");
+                        int slen = (int)r.Le(lb);
+                        Require(r);
+                        if (slen > ValueCap - 1) throw new BinlogException("unsupported");
+                        b.JsonStr(r.Strn(slen, ValueCap));
+                        break;
+                    }
+                default:
+                    throw new BinlogException("unsupported");
+            }
+            Require(r);
+        }
+
+        private static void DecodeRows(ByteReader r, TableSchema s, ulong present, Serializer b)
+        {
+            int nbSize = (s.NullableCount + 7) / 8;
+            if (nbSize > 8) throw new BinlogException("unsupported");
+            b.Puts(",\"rows\":[");
+            int rowno = 0;
+            while (r.Rem() > 0 && r.Error == null)
+            {
+                ulong nullbm = r.Le(nbSize);
+                Require(r);
+                if (rowno > 0) b.Putc(',');
+                b.Putc('[');
+                bool first = true;
+                for (int i = 0; i < s.ColumnCount; i++)
+                {
+                    if (!Bit(present, i)) continue;
+                    if (!first) b.Putc(',');
+                    first = false;
+                    DecodeValue(r, s, i, Bit(nullbm, i), b);
+                }
+                b.Putc(']');
+                rowno++;
+            }
+            b.Puts("]}");
+            Require(r);
+        }
+
+        /* ================================================================== */
+        /* [6] EventParser: header, framing, per-event dispatch.             */
+        /* ================================================================== */
         public static EventHeader ParseHeader(byte[] data)
         {
-            if (data.Length < 19) throw new BinlogException("truncated");
-            var r = new Reader(data);
+            if (data == null || data.Length < HeaderSize)
+                throw new BinlogException("truncated");
+            var r = new ByteReader(data, 0, HeaderSize);
             var h = new EventHeader();
             h.Timestamp = (uint)r.Le(4);
             h.EventType = (byte)r.Le(1);
@@ -106,249 +351,279 @@ namespace MysqlBinlog
             h.EventSize = (uint)r.Le(4);
             h.NextPosition = (uint)r.Le(4);
             h.Flags = (ushort)r.Le(2);
+            Require(r);
             return h;
-        }
-
-        private static void JStr(StringBuilder b, string s)
-        {
-            b.Append('"');
-            foreach (char c in s)
-            {
-                switch (c)
-                {
-                    case '"': b.Append("\\\""); break;
-                    case '\\': b.Append("\\\\"); break;
-                    case '\n': b.Append("\\n"); break;
-                    case '\r': b.Append("\\r"); break;
-                    case '\t': b.Append("\\t"); break;
-                    default:
-                        if (c < 0x20) b.Append("\\u").Append(((int)c).ToString("x4"));
-                        else b.Append(c);
-                        break;
-                }
-            }
-            b.Append('"');
         }
 
         private static string RowsName(int t)
         {
-            if (t == 30) return "WRITE_ROWS_EVENT_V2";
-            if (t == 31) return "UPDATE_ROWS_EVENT_V2";
-            if (t == 32) return "DELETE_ROWS_EVENT_V2";
+            if (t == EvWriteRowsV2) return "WRITE_ROWS_EVENT_V2";
+            if (t == EvUpdateRowsV2) return "UPDATE_ROWS_EVENT_V2";
+            if (t == EvDeleteRowsV2) return "DELETE_ROWS_EVENT_V2";
             return "ROWS_EVENT_V2";
         }
 
+        private static void ParseFde(ByteReader r, EventHeader h, Serializer b)
+        {
+            if (r.Rem() < 2 + ServerVersionLen + 1) throw new BinlogException("truncated");
+            ulong bv = r.Le(2);
+            byte[] tmp = r.Raw(ServerVersionLen);
+            int k = 0;
+            while (k < tmp.Length && tmp[k] != 0) k++;
+            string sv = Encoding.UTF8.GetString(tmp, 0, k);
+            byte alg = r.LastByte();
+            Require(r);
+            b.Puts("{\"type\":\"FORMAT_DESCRIPTION_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"binlog_version\":");
+            b.UInt(bv);
+            b.Puts(",\"server_version\":");
+            b.JsonStr(sv);
+            b.Puts(",\"checksum_alg\":");
+            b.UInt((ulong)alg);
+            b.Putc('}');
+        }
+
+        private static void ParseGtid(ByteReader r, EventHeader h, Serializer b)
+        {
+            r.Le(1); // flags
+            byte[] sid = r.Raw(16);
+            ulong gno = r.Le(8);
+            Require(r);
+            var sh = new StringBuilder(32);
+            foreach (byte x in sid) { sh.Append(Hex[x >> 4]); sh.Append(Hex[x & 0x0F]); }
+            b.Puts("{\"type\":\"GTID_LOG_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"gno\":");
+            b.UInt(gno);
+            b.Puts(",\"sid\":");
+            b.JsonStr(sh.ToString());
+            b.Putc('}');
+        }
+
+        private static void ParseQuery(ByteReader r, EventHeader h, Serializer b)
+        {
+            r.Le(4); // thread_id
+            r.Le(4); // exec_time
+            int dbl = (int)r.Le(1);
+            r.Le(2); // error_code
+            int svl = (int)r.Le(2);
+            r.Skip(svl); // status_vars
+            string db = r.Strn(dbl, NameCap);
+            r.Le(1); // trailing NUL after db
+            int queryLen = r.Rem();
+            string query = r.Strn(queryLen, StrCap);
+            Require(r);
+            b.Puts("{\"type\":\"QUERY_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"db\":");
+            b.JsonStr(db);
+            b.Puts(",\"query\":");
+            b.JsonStr(query);
+            b.Putc('}');
+        }
+
+        private static void ParseRowsQuery(ByteReader r, EventHeader h, Serializer b)
+        {
+            ulong ln = r.Lenenc();
+            string q = r.Strn((int)ln, StrCap);
+            Require(r);
+            b.Puts("{\"type\":\"ROWS_QUERY_LOG_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"query\":");
+            b.JsonStr(q);
+            b.Putc('}');
+        }
+
+        private static void ParseTableMap(ByteReader r, EventHeader h,
+                                          SchemaRegistry reg, Serializer b)
+        {
+            var s = new TableSchema();
+            s.TableId = r.Le(6);
+            r.Le(2); // flags
+            int dbl = (int)r.Le(1);
+            s.Db = r.Strn(dbl, NameCap);
+            r.Le(1); // NUL
+            int tbl = (int)r.Le(1);
+            s.Table = r.Strn(tbl, NameCap);
+            r.Le(1); // NUL
+            int cc = (int)r.Lenenc();
+            Require(r);
+            if (cc == 0 || cc > MaxCols) throw new BinlogException("unsupported");
+            s.ColumnCount = cc;
+            s.ColumnTypes = new int[cc];
+            s.VarcharLenBytes = new int[cc];
+            for (int i = 0; i < cc; i++) s.ColumnTypes[i] = (int)r.Le(1);
+
+            ulong mdLen = r.Lenenc();
+            int mdStart = r.Pos;
+            if (r.Error != null || mdLen > (ulong)r.Len || mdStart > r.Len - (int)mdLen)
+                throw new BinlogException("truncated");
+            for (int i = 0; i < cc; i++)
+            {
+                if (s.ColumnTypes[i] == TypeVarchar)
+                {
+                    if (r.Pos + 2 > mdStart + (int)mdLen) throw new BinlogException("truncated");
+                    ulong mx = r.Le(2);
+                    s.VarcharLenBytes[i] = mx > 255 ? 2 : 1;
+                }
+            }
+            r.Pos = mdStart + (int)mdLen; // skip any extra metadata
+
+            int nb = (cc + 7) / 8;
+            if (nb > 8) throw new BinlogException("unsupported");
+            ulong nullbm = r.Le(nb);
+            int nullable = 0;
+            for (int i = 0; i < cc; i++) if (Bit(nullbm, i)) nullable++;
+            s.NullableCount = nullable;
+            Require(r);
+            reg.Put(s);
+
+            b.Puts("{\"type\":\"TABLE_MAP_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"table_id\":");
+            b.UInt(s.TableId);
+            b.Puts(",\"db\":");
+            b.JsonStr(s.Db);
+            b.Puts(",\"table\":");
+            b.JsonStr(s.Table);
+            b.Puts(",\"column_count\":");
+            b.UInt((ulong)cc);
+            b.Puts(",\"column_types\":[");
+            for (int i = 0; i < cc; i++)
+            {
+                if (i > 0) b.Putc(',');
+                b.UInt((ulong)s.ColumnTypes[i]);
+            }
+            b.Puts("]}");
+        }
+
+        private static void ParseRowsV2(ByteReader r, EventHeader h,
+                                        SchemaRegistry reg, Serializer b)
+        {
+            ulong tid = r.Le(6);
+            r.Le(2); // flags
+            ulong extraLen = r.Le(2); // includes its own 2 bytes
+            if (extraLen < 2) throw new BinlogException("unsupported");
+            r.Skip((int)extraLen - 2);
+            int cc = (int)r.Lenenc();
+            Require(r);
+            if (cc == 0 || cc > MaxCols) throw new BinlogException("unsupported");
+            int bmSize = (cc + 7) / 8;
+            if (bmSize > 8) throw new BinlogException("unsupported");
+            ulong present = r.Le(bmSize);
+            if (h.EventType == EvUpdateRowsV2) r.Le(bmSize); // before/after bitmap
+            Require(r);
+            TableSchema s = reg.Get(tid);
+            if (s == null) throw new BinlogException("no_schema");
+
+            b.Puts("{\"type\":\"");
+            b.Puts(RowsName(h.EventType));
+            b.Puts("\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"table_id\":");
+            b.UInt(tid);
+            b.Puts(",\"db\":");
+            b.JsonStr(s.Db);
+            b.Puts(",\"table\":");
+            b.JsonStr(s.Table);
+            DecodeRows(r, s, present, b);
+        }
+
+        private static void ParseXid(ByteReader r, EventHeader h, Serializer b)
+        {
+            ulong xid = r.Le(8);
+            Require(r);
+            b.Puts("{\"type\":\"XID_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"xid\":");
+            b.UInt(xid);
+            b.Putc('}');
+        }
+
+        private static void ParseRotate(ByteReader r, EventHeader h, Serializer b)
+        {
+            ulong position = r.Le(8);
+            int nfLen = r.Rem();
+            string nf = r.Strn(nfLen, StrCap);
+            Require(r);
+            b.Puts("{\"type\":\"ROTATE_EVENT\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"position\":");
+            b.UInt(position);
+            b.Puts(",\"next_file\":");
+            b.JsonStr(nf);
+            b.Putc('}');
+        }
+
+        private static void ParseUnknown(EventHeader h, Serializer b)
+        {
+            b.Puts("{\"type\":\"UNKNOWN\",\"timestamp\":");
+            b.UInt(h.Timestamp);
+            b.Puts(",\"type_id\":");
+            b.UInt((ulong)h.EventType);
+            b.Puts(",\"event_size\":");
+            b.UInt(h.EventSize);
+            b.Putc('}');
+        }
+
+        /// <summary>Dispatch one verified event body to its named handler.</summary>
+        private static void DispatchEvent(EventHeader h, byte[] data, int bodyStart,
+                                          int bodyLen, SchemaRegistry reg, Serializer b)
+        {
+            var r = new ByteReader(data, bodyStart, bodyLen);
+            switch (h.EventType)
+            {
+                case EvFormatDesc: ParseFde(r, h, b); break;
+                case EvGtid: ParseGtid(r, h, b); break;
+                case EvQuery: ParseQuery(r, h, b); break;
+                case EvRowsQuery: ParseRowsQuery(r, h, b); break;
+                case EvTableMap: ParseTableMap(r, h, reg, b); break;
+                case EvWriteRowsV2:
+                case EvUpdateRowsV2:
+                case EvDeleteRowsV2: ParseRowsV2(r, h, reg, b); break;
+                case EvXid: ParseXid(r, h, b); break;
+                case EvRotate: ParseRotate(r, h, b); break;
+                default: ParseUnknown(h, b); break; // UNKNOWN -> stable skip
+            }
+        }
+
+        /* ================================================================== */
+        /* [7] Public API: whole-buffer parser.                              */
+        /* ================================================================== */
         public static string ParseBuffer(byte[] data)
         {
-            if (data.Length < 4) throw new BinlogException("invalid");
-            if (!(data[0] == 0xFE && data[1] == (byte)'b' && data[2] == (byte)'i' && data[3] == (byte)'n'))
-                throw new BinlogException("invalid");
+            if (data == null || data.Length < MagicSize) throw new BinlogException("invalid");
+            for (int i = 0; i < MagicSize; i++)
+                if (data[i] != Magic[i]) throw new BinlogException("invalid");
 
-            var reg = new Dictionary<ulong, Schema>();
+            var reg = new SchemaRegistry();
             var outSb = new StringBuilder();
-            int pos = 4; // skip magic
+            int pos = MagicSize;
             while (pos < data.Length)
             {
-                if (pos + 19 > data.Length) throw new BinlogException("truncated");
-                var hdr = new byte[19];
-                Array.Copy(data, pos, hdr, 0, 19);
+                if (data.Length - pos < HeaderSize) throw new BinlogException("truncated");
+                var hdr = new byte[HeaderSize];
+                Array.Copy(data, pos, hdr, 0, HeaderSize);
                 EventHeader h = ParseHeader(hdr);
                 long es = h.EventSize;
-                if (es < 23 || pos + es > data.Length) throw new BinlogException("truncated");
-                var full = new byte[(int)es];
-                Array.Copy(data, pos, full, 0, (int)es);
-                ulong stored = Le(full, (int)es - 4, 4);
-                uint calc = Crc32(full, 0, (int)es - 4);
+                if (es < HeaderSize + CrcSize || es > MaxEventSize || es > data.Length - pos)
+                    throw new BinlogException("truncated");
+                int eventSize = (int)es;
+
+                // Every event in the controlled subset carries CRC32 (FDE
+                // declares checksum_alg=1), so verify unconditionally.
+                ulong stored = PeekLe(data, pos + eventSize - CrcSize, CrcSize);
+                uint calc = Crc32(data, pos, eventSize - CrcSize);
                 if (stored != calc) throw new BinlogException("checksum");
-                var body = new byte[(int)es - 23];
-                Array.Copy(full, 19, body, 0, body.Length);
-                var r = new Reader(body);
-                var b = new StringBuilder();
-                int t = h.EventType;
-                uint ts = h.Timestamp;
 
-                switch (t)
-                {
-                    case 15: // FORMAT_DESCRIPTION_EVENT
-                    {
-                        ulong bv = r.Le(2);
-                        byte[] tmp = r.Raw(50);
-                        int k = 0;
-                        while (k < 50 && tmp[k] != 0) k++;
-                        string sv = Encoding.UTF8.GetString(tmp, 0, k);
-                        ulong alg = body[body.Length - 1];
-                        b.Append("{\"type\":\"FORMAT_DESCRIPTION_EVENT\",\"timestamp\":").Append(ts)
-                         .Append(",\"binlog_version\":").Append(bv).Append(",\"server_version\":");
-                        JStr(b, sv);
-                        b.Append(",\"checksum_alg\":").Append(alg).Append('}');
-                        break;
-                    }
-                    case 33: // GTID_LOG_EVENT
-                    {
-                        r.Le(1); // flags
-                        byte[] sid = r.Raw(16);
-                        ulong gno = r.Le(8);
-                        var sh = new StringBuilder();
-                        foreach (byte x in sid) sh.Append(x.ToString("x2"));
-                        b.Append("{\"type\":\"GTID_LOG_EVENT\",\"timestamp\":").Append(ts)
-                         .Append(",\"gno\":").Append(gno).Append(",\"sid\":");
-                        JStr(b, sh.ToString());
-                        b.Append('}');
-                        break;
-                    }
-                    case 2: // QUERY_EVENT
-                    {
-                        r.Le(4); // thread_id
-                        r.Le(4); // exec_time
-                        int dbl = (int)r.Le(1);
-                        r.Le(2);  // error_code
-                        int svl = (int)r.Le(2);
-                        r.Skip(svl);
-                        string db = r.Text(dbl);
-                        r.Le(1); // trailing NUL
-                        string query = r.Text(r.Rem());
-                        b.Append("{\"type\":\"QUERY_EVENT\",\"timestamp\":").Append(ts).Append(",\"db\":");
-                        JStr(b, db);
-                        b.Append(",\"query\":");
-                        JStr(b, query);
-                        b.Append('}');
-                        break;
-                    }
-                    case 29: // ROWS_QUERY_LOG_EVENT
-                    {
-                        int ln = (int)r.Lenenc();
-                        string q = r.Text(ln);
-                        b.Append("{\"type\":\"ROWS_QUERY_LOG_EVENT\",\"timestamp\":").Append(ts)
-                         .Append(",\"query\":");
-                        JStr(b, q);
-                        b.Append('}');
-                        break;
-                    }
-                    case 19: // TABLE_MAP_EVENT
-                    {
-                        var s = new Schema();
-                        s.TableId = r.Le(6);
-                        r.Le(2); // flags
-                        int dbl = (int)r.Le(1);
-                        s.Db = r.Text(dbl);
-                        r.Le(1); // NUL
-                        int tbl = (int)r.Le(1);
-                        s.Table = r.Text(tbl);
-                        r.Le(1); // NUL
-                        s.Cc = (int)r.Lenenc();
-                        s.Types = new int[s.Cc];
-                        s.Vlen = new int[s.Cc];
-                        for (int i = 0; i < s.Cc; i++) s.Types[i] = (int)r.Le(1);
-                        ulong mdlen = r.Lenenc();
-                        int mdstart = r.Pos;
-                        for (int i = 0; i < s.Cc; i++)
-                        {
-                            if (s.Types[i] == 15)
-                            {
-                                ulong mx = r.Le(2);
-                                s.Vlen[i] = (mx > 255) ? 2 : 1;
-                            }
-                        }
-                        r.Pos = mdstart + (int)mdlen;
-                        int nb = (s.Cc + 7) / 8;
-                        ulong nullbm = r.Le(nb);
-                        int nullable = 0;
-                        for (int i = 0; i < s.Cc; i++) if ((nullbm & (1UL << i)) != 0) nullable++;
-                        s.Nullable = nullable;
-                        reg[s.TableId] = s;
-
-                        b.Append("{\"type\":\"TABLE_MAP_EVENT\",\"timestamp\":").Append(ts)
-                         .Append(",\"table_id\":").Append(s.TableId).Append(",\"db\":");
-                        JStr(b, s.Db);
-                        b.Append(",\"table\":");
-                        JStr(b, s.Table);
-                        b.Append(",\"column_count\":").Append(s.Cc).Append(",\"column_types\":[");
-                        for (int i = 0; i < s.Cc; i++)
-                        {
-                            if (i > 0) b.Append(',');
-                            b.Append(s.Types[i]);
-                        }
-                        b.Append("]}");
-                        break;
-                    }
-                    case 30: case 31: case 32: // ROWS_EVENT_V2
-                    {
-                        ulong tid = r.Le(6);
-                        r.Le(2); // flags
-                        ulong el = r.Le(2);
-                        if (el >= 2) r.Skip((int)el - 2);
-                        int cc = (int)r.Lenenc();
-                        int bm = (cc + 7) / 8;
-                        ulong present1 = r.Le(bm);
-                        if (t == 31) r.Le(bm); // bitmap2, equal
-                        Schema s;
-                        if (!reg.TryGetValue(tid, out s)) throw new BinlogException("no_schema");
-                        int nbs = (s.Nullable + 7) / 8;
-
-                        b.Append("{\"type\":\"").Append(RowsName(t))
-                         .Append("\",\"timestamp\":").Append(ts)
-                         .Append(",\"table_id\":").Append(tid).Append(",\"db\":");
-                        JStr(b, s.Db);
-                        b.Append(",\"table\":");
-                        JStr(b, s.Table);
-                        b.Append(",\"rows\":[");
-                        int rowno = 0;
-                        while (r.Rem() > 0)
-                        {
-                            ulong nullbm = r.Le(nbs);
-                            if (rowno > 0) b.Append(',');
-                            b.Append('[');
-                            bool first = true;
-                            for (int i = 0; i < s.Cc; i++)
-                            {
-                                if ((present1 & (1UL << i)) == 0) continue;
-                                if (!first) b.Append(',');
-                                first = false;
-                                if ((nullbm & (1UL << i)) != 0) { b.Append("null"); continue; }
-                                int ct = s.Types[i];
-                                if (ct == 8) b.Append(r.Le(8));
-                                else if (ct == 3) b.Append(r.Le(4));
-                                else if (ct == 15)
-                                {
-                                    int lb = s.Vlen[i] == 0 ? 1 : s.Vlen[i];
-                                    int slen = (int)r.Le(lb);
-                                    JStr(b, r.Text(slen));
-                                }
-                                else throw new BinlogException("unsupported");
-                            }
-                            b.Append(']');
-                            rowno++;
-                        }
-                        b.Append("]}");
-                        break;
-                    }
-                    case 16: // XID_EVENT
-                    {
-                        ulong xid = r.Le(8);
-                        b.Append("{\"type\":\"XID_EVENT\",\"timestamp\":").Append(ts)
-                         .Append(",\"xid\":").Append(xid).Append('}');
-                        break;
-                    }
-                    case 4: // ROTATE_EVENT
-                    {
-                        ulong position = r.Le(8);
-                        string nf = r.Text(r.Rem());
-                        b.Append("{\"type\":\"ROTATE_EVENT\",\"timestamp\":").Append(ts)
-                         .Append(",\"position\":").Append(position).Append(",\"next_file\":");
-                        JStr(b, nf);
-                        b.Append('}');
-                        break;
-                    }
-                    default: // UNKNOWN -> safe skip
-                    {
-                        b.Append("{\"type\":\"UNKNOWN\",\"timestamp\":").Append(ts)
-                         .Append(",\"type_id\":").Append(t)
-                         .Append(",\"event_size\":").Append(es).Append('}');
-                        break;
-                    }
-                }
-                outSb.Append(b).Append('\n');
-                pos += (int)es;
+                int bodyStart = pos + HeaderSize;
+                int bodyLen = eventSize - HeaderSize - CrcSize;
+                var b = new Serializer(LineCap);
+                DispatchEvent(h, data, bodyStart, bodyLen, reg, b);
+                if (b.Overflow) throw new BinlogException("invalid");
+                outSb.Append(b.Line()).Append('\n');
+                pos += eventSize;
             }
             return outSb.ToString();
         }

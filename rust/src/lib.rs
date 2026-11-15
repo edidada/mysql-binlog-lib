@@ -93,6 +93,8 @@ impl<'a> Reader<'a> {
         self.pos = n;
     }
 
+    pub fn pos(&self) -> usize { self.pos }
+
     /// Overflow-safe `pos + n <= len` test.
     fn can(&self, n: usize) -> bool {
         self.error.is_none() && n <= self.len && self.pos <= self.len - n
