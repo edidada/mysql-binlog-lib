@@ -1,16 +1,63 @@
 // Package binlog implements the Phase 1 offline MySQL binlog parser for the
 // controlled subset described in docs/design.md. It emits canonical JSONL
-// shared by the C, C++, Rust and Go implementations.
+// shared by all ten language implementations.
+//
+// Layered structure (mirrors c/src/mysqlbinlog.c):
+//
+//   [1] ByteReader     bounds-checked little-endian primitives
+//   [2] CRC-32         IEEE / zlib checksum
+//   [3] Serializer     canonical JSONL builder (fixed key order, no spaces)
+//   [4] SchemaRegistry table_id -> TableSchema
+//   [5] RowDecoder     decode RowsEventV2 rows using a registered schema
+//   [6] EventParser    frame/verify/dispatch events -> one JSONL line each
+//   [7] Public API     ParseHeader / CRC32 / ParseBuffer
+//
+// The public API and the canonical JSONL are a cross-language contract shared
+// by the other nine implementations and fixtures/expected.jsonl.
 package binlog
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"strings"
 )
+
+// ==================================================================
+// [0] Protocol constants (docs/design.md sections 2-3).
+// ==================================================================
+const (
+	headerSize = 19
+	crcSize    = 4
+	magicSize  = 4
+
+	maxCols       = 64
+	maxTables     = 64
+	maxEventSize  = 256 * 1024 * 1024 // defence against corrupt event sizes
+	lineCap       = 16384             // max single JSONL line
+	strCap        = 2048              // max query / next_file string
+	valueCap      = 512               // max VARCHAR value
+	nameCap       = 128               // max db / table name
+	serverVersion = 50                // FDE server_version field length
+
+	typeLong     = 3
+	typeLonglong = 8
+	typeVarchar  = 15
+
+	evQuery         = 2
+	evRotate        = 4
+	evFormatDesc    = 15
+	evXid           = 16
+	evTableMap      = 19
+	evRowsQuery     = 29
+	evWriteRowsV2   = 30
+	evUpdateRowsV2  = 31
+	evDeleteRowsV2  = 32
+	evGtid          = 33
+)
+
+var magic = [magicSize]byte{0xFE, 0x62, 0x69, 0x6E}
 
 var (
 	ErrInvalid     = errors.New("invalid binlog")
@@ -30,38 +77,41 @@ type EventHeader struct {
 	Flags        uint16
 }
 
-// ---- ByteReader ----------------------------------------------------------
+// ==================================================================
+// [1] ByteReader: every read is bounds-checked; err latches.
+// ==================================================================
 type reader struct {
 	data []byte
+	len  int
 	pos  int
 	err  error
 }
 
-func newReader(data []byte) *reader { return &reader{data: data} }
-
-func (r *reader) rem() int {
-	if r.pos >= len(r.data) {
-		return 0
-	}
-	return len(r.data) - r.pos
+func newReader(data []byte) *reader {
+	return &reader{data: data, len: len(data)}
 }
 
-func (r *reader) position() int  { return r.pos }
-func (r *reader) setPos(n int)   { r.pos = n }
-
-func (r *reader) lastByte() byte {
-	if len(r.data) == 0 {
+func (r *reader) rem() int {
+	if r.pos > r.len {
 		return 0
 	}
-	return r.data[len(r.data)-1]
+	return r.len - r.pos
+}
+
+// can is the overflow-safe "pos + n <= len" test.
+func (r *reader) can(n int) bool {
+	return r.err == nil && n >= 0 && n <= r.len && r.pos <= r.len-n
+}
+
+func (r *reader) fail(err error) {
+	if r.err == nil {
+		r.err = err
+	}
 }
 
 func (r *reader) le(n int) uint64 {
-	if r.err != nil {
-		return 0
-	}
-	if n < 0 || n > 8 || r.pos+n > len(r.data) {
-		r.err = ErrTruncated
+	if n > 8 || !r.can(n) {
+		r.fail(ErrTruncated)
 		return 0
 	}
 	var v uint64
@@ -73,11 +123,8 @@ func (r *reader) le(n int) uint64 {
 }
 
 func (r *reader) raw(n int) []byte {
-	if r.err != nil {
-		return nil
-	}
-	if r.pos+n > len(r.data) {
-		r.err = ErrTruncated
+	if !r.can(n) {
+		r.fail(ErrTruncated)
 		return nil
 	}
 	b := r.data[r.pos : r.pos+n]
@@ -85,83 +132,133 @@ func (r *reader) raw(n int) []byte {
 	return b
 }
 
-func (r *reader) strn(n int) string {
-	b := r.raw(n)
-	if b == nil {
+// strn reads exactly n bytes as a bounded NUL-terminated string. The reader
+// always advances by n (alignment preserved) even if the string is truncated.
+func (r *reader) strn(n, cap int) string {
+	if cap == 0 {
 		return ""
 	}
-	return string(b)
+	if !r.can(n) {
+		r.fail(ErrTruncated)
+		return ""
+	}
+	m := n
+	if m > cap-1 {
+		m = cap - 1
+	}
+	s := string(r.data[r.pos : r.pos+m])
+	r.pos += n
+	return s
 }
 
 func (r *reader) skip(n int) {
-	if r.err != nil {
-		return
-	}
-	if r.pos+n > len(r.data) {
-		r.err = ErrTruncated
-		r.pos = len(r.data)
+	if !r.can(n) {
+		r.fail(ErrTruncated)
 		return
 	}
 	r.pos += n
 }
 
-func (r *reader) lenenc() (uint64, bool) {
+// lenenc reads a MySQL length-encoded integer. 0xFB (NULL) and 0xFF
+// (reserved) are not valid lengths where a length is required.
+func (r *reader) lenenc() uint64 {
 	b := byte(r.le(1))
 	switch {
 	case b < 0xFB:
-		return uint64(b), false
-	case b == 0xFB:
-		return 0, true
+		return uint64(b)
 	case b == 0xFC:
-		return r.le(2), false
+		return r.le(2)
 	case b == 0xFD:
-		return r.le(3), false
+		return r.le(3)
 	case b == 0xFE:
-		return r.le(8), false
+		return r.le(8)
 	default:
-		return 0, false
+		r.fail(ErrUnsupported)
+		return 0
 	}
 }
 
-func (r *reader) lenencU() uint64 { v, _ := r.lenenc(); return v }
+func (r *reader) position() int { return r.pos }
+func (r *reader) setPos(n int)  { r.pos = n }
 
-// ---- CRC-32 --------------------------------------------------------------
-func CRC32(data []byte) uint32 { return crc32.ChecksumIEEE(data) }
+// ==================================================================
+// [2] CRC-32 (IEEE 802.3 / zlib).
+// Vector: CRC32([]byte("123456789")) == 0xCBF43926.
+// ==================================================================
+func CRC32(data []byte) uint32 {
+	c := uint32(0xFFFFFFFF)
+	for _, b := range data {
+		c ^= uint32(b)
+		for k := 0; k < 8; k++ {
+			mask := uint32(0) - (c & 1)
+			c = (c >> 1) ^ (0xEDB88320 & mask)
+		}
+	}
+	return ^c
+}
 
-// ---- Canonical JSON helpers ---------------------------------------------
-func num(v interface{}) string { return fmt.Sprint(v) }
+// ==================================================================
+// [3] Serializer: bounded canonical JSONL builder.
+// ==================================================================
+type serializer struct {
+	parts    []string
+	length   int
+	cap      int
+	overflow bool
+}
 
-func jsonStr(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
+func newSerializer() *serializer { return &serializer{cap: lineCap} }
+
+func (b *serializer) append(s string) {
+	if b.overflow {
+		return
+	}
+	if b.length+len(s) > b.cap {
+		b.overflow = true
+		return
+	}
+	b.parts = append(b.parts, s)
+	b.length += len(s)
+}
+
+func (b *serializer) putc(c byte) { b.append(string(c)) }
+func (b *serializer) puts(s string) { b.append(s) }
+func (b *serializer) uint(v interface{}) { b.append(fmt.Sprint(v)) }
+
+// jsonStr does minimal JSON escaping: quotes, backslash, control characters.
+func (b *serializer) jsonStr(s string) {
+	b.putc('"')
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch c {
 		case '"':
-			b.WriteString(`\"`)
+			b.puts(`\"`)
 		case '\\':
-			b.WriteString(`\\`)
+			b.puts(`\\`)
 		case '\n':
-			b.WriteString(`\n`)
+			b.puts(`\n`)
 		case '\r':
-			b.WriteString(`\r`)
+			b.puts(`\r`)
 		case '\t':
-			b.WriteString(`\t`)
+			b.puts(`\t`)
 		default:
 			if c < 0x20 {
-				fmt.Fprintf(&b, `\u%04x`, c)
+				b.append(fmt.Sprintf(`\u%04x`, c))
 			} else {
-				b.WriteByte(c)
+				b.putc(c)
 			}
 		}
 	}
-	b.WriteByte('"')
-	return b.String()
+	b.putc('"')
 }
+
+func (b *serializer) line() string { return strings.Join(b.parts, "") }
 
 func bit(v uint64, i int) bool { return v&(uint64(1)<<uint(i)) != 0 }
 
-// ---- SchemaRegistry ------------------------------------------------------
+// ==================================================================
+// [4] SchemaRegistry: table_id -> TableSchema, per-file lifetime.
+// ==================================================================
 type schema struct {
 	tableID         uint64
 	db, table       string
@@ -180,7 +277,9 @@ func (g *registry) put(s schema) {
 			return
 		}
 	}
-	g.v = append(g.v, s)
+	if len(g.v) < maxTables {
+		g.v = append(g.v, s)
+	}
 }
 
 func (g *registry) get(id uint64) *schema {
@@ -192,21 +291,76 @@ func (g *registry) get(id uint64) *schema {
 	return nil
 }
 
-func rowsName(t uint8) string {
-	switch t {
-	case 30:
-		return "WRITE_ROWS_EVENT_V2"
-	case 31:
-		return "UPDATE_ROWS_EVENT_V2"
-	case 32:
-		return "DELETE_ROWS_EVENT_V2"
+// ==================================================================
+// [5] RowDecoder: decode a row sequence against a TableSchema.
+// ==================================================================
+func decodeValue(r *reader, s *schema, col int, isNull bool, b *serializer) error {
+	if isNull {
+		b.puts("null")
+		return r.err
 	}
-	return "ROWS_EVENT_V2"
+	switch s.columnTypes[col] {
+	case typeLonglong:
+		b.uint(int64(r.le(8)))
+	case typeLong:
+		b.uint(int32(uint32(r.le(4))))
+	case typeVarchar:
+		lb := s.varcharLenBytes[col]
+		if lb != 1 && lb != 2 {
+			return ErrUnsupported
+		}
+		slen := int(r.le(lb))
+		if slen > valueCap-1 {
+			return ErrUnsupported
+		}
+		b.jsonStr(r.strn(slen, valueCap))
+	default:
+		return ErrUnsupported
+	}
+	return r.err
 }
 
-// ---- Public API ----------------------------------------------------------
+func decodeRows(r *reader, s *schema, present uint64, b *serializer) error {
+	nbSize := (s.nullableCount + 7) / 8
+	if nbSize > 8 {
+		return ErrUnsupported
+	}
+	b.puts(`,"rows":[`)
+	rowno := 0
+	for r.rem() > 0 && r.err == nil {
+		nullbm := r.le(nbSize)
+		if r.err != nil {
+			return r.err
+		}
+		if rowno > 0 {
+			b.putc(',')
+		}
+		b.putc('[')
+		first := true
+		for i := 0; i < s.columnCount; i++ {
+			if !bit(present, i) {
+				continue
+			}
+			if !first {
+				b.putc(',')
+			}
+			first = false
+			if err := decodeValue(r, s, i, bit(nullbm, i), b); err != nil {
+				return err
+			}
+		}
+		b.putc(']')
+		rowno++
+	}
+	b.puts(`]}`)
+	return r.err
+}
+
+// ==================================================================
+// [6] EventParser: header, framing, per-event dispatch.
+// ==================================================================
 func ParseHeader(data []byte) (EventHeader, error) {
-	if len(data) < 19 {
+	if len(data) < headerSize {
 		return EventHeader{}, ErrTruncated
 	}
 	r := newReader(data)
@@ -220,281 +374,332 @@ func ParseHeader(data []byte) (EventHeader, error) {
 	return h, r.err
 }
 
-func emit(h *EventHeader, body []byte, r *reader, reg *registry) (string, error) {
-	var b strings.Builder
-	switch h.EventType {
-	case 15: // FORMAT_DESCRIPTION_EVENT
-		bv := uint16(r.le(2))
-		tmp := r.raw(50)
-		alg := r.lastByte()
-		var sv strings.Builder
-		for _, c := range tmp {
-			if c == 0 {
-				break
-			}
-			sv.WriteByte(c)
-		}
-		b.WriteString(`{"type":"FORMAT_DESCRIPTION_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"binlog_version":`)
-		b.WriteString(num(bv))
-		b.WriteString(`,"server_version":`)
-		b.WriteString(jsonStr(sv.String()))
-		b.WriteString(`,"checksum_alg":`)
-		b.WriteString(num(alg))
-		b.WriteByte('}')
-
-	case 33: // GTID_LOG_EVENT
-		r.le(1) // flags
-		sid := r.raw(16)
-		gno := r.le(8)
-		sh := fmt.Sprintf("%x", sid)
-		b.WriteString(`{"type":"GTID_LOG_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"gno":`)
-		b.WriteString(num(gno))
-		b.WriteString(`,"sid":`)
-		b.WriteString(jsonStr(sh))
-		b.WriteByte('}')
-
-	case 2: // QUERY_EVENT
-		r.le(4) // thread_id
-		r.le(4) // exec_time
-		dbl := int(r.le(1))
-		r.le(2) // error_code
-		svl := int(r.le(2))
-		r.skip(svl)
-		db := r.strn(dbl)
-		r.le(1) // trailing NUL
-		query := r.strn(r.rem())
-		b.WriteString(`{"type":"QUERY_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"db":`)
-		b.WriteString(jsonStr(db))
-		b.WriteString(`,"query":`)
-		b.WriteString(jsonStr(query))
-		b.WriteByte('}')
-
-	case 29: // ROWS_QUERY_LOG_EVENT
-		ln := r.lenencU()
-		q := r.strn(int(ln))
-		b.WriteString(`{"type":"ROWS_QUERY_LOG_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"query":`)
-		b.WriteString(jsonStr(q))
-		b.WriteByte('}')
-
-	case 19: // TABLE_MAP_EVENT
-		var s schema
-		s.tableID = r.le(6)
-		r.le(2) // flags
-		dbl := int(r.le(1))
-		s.db = r.strn(dbl)
-		r.le(1) // NUL
-		tl := int(r.le(1))
-		s.table = r.strn(tl)
-		r.le(1) // NUL
-		cc := int(r.lenencU())
-		s.columnCount = cc
-		for i := 0; i < cc; i++ {
-			s.columnTypes = append(s.columnTypes, byte(r.le(1)))
-		}
-		mdlen := int(r.lenencU())
-		mdstart := r.position()
-		for i := 0; i < cc; i++ {
-			if s.columnTypes[i] == 15 {
-				mx := uint16(r.le(2))
-				if mx > 255 {
-					s.varcharLenBytes = append(s.varcharLenBytes, 2)
-				} else {
-					s.varcharLenBytes = append(s.varcharLenBytes, 1)
-				}
-			} else {
-				s.varcharLenBytes = append(s.varcharLenBytes, 0)
-			}
-		}
-		r.setPos(mdstart + mdlen)
-		nb := (cc + 7) / 8
-		nullbm := r.le(nb)
-		nullable := 0
-		for i := 0; i < cc; i++ {
-			if bit(nullbm, i) {
-				nullable++
-			}
-		}
-		s.nullableCount = nullable
-		reg.put(s)
-
-		b.WriteString(`{"type":"TABLE_MAP_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"table_id":`)
-		b.WriteString(num(s.tableID))
-		b.WriteString(`,"db":`)
-		b.WriteString(jsonStr(s.db))
-		b.WriteString(`,"table":`)
-		b.WriteString(jsonStr(s.table))
-		b.WriteString(`,"column_count":`)
-		b.WriteString(num(cc))
-		b.WriteString(`,"column_types":[`)
-		for i := 0; i < cc; i++ {
-			if i > 0 {
-				b.WriteByte(',')
-			}
-			b.WriteString(num(s.columnTypes[i]))
-		}
-		b.WriteString(`]}`)
-
-	case 30, 31, 32: // ROWS_EVENT_V2
-		tid := r.le(6)
-		r.le(2) // flags
-		el := int(r.le(2))
-		if el >= 2 {
-			r.skip(el - 2)
-		}
-		cc := int(r.lenencU())
-		bm := (cc + 7) / 8
-		present1 := r.le(bm)
-		if h.EventType == 31 {
-			r.le(bm) // bitmap2, equal
-		}
-		se := reg.get(tid)
-		if se == nil {
-			return "", ErrNoSchema
-		}
-		nbs := (se.nullableCount + 7) / 8
-
-		b.WriteString(`{"type":"`)
-		b.WriteString(rowsName(h.EventType))
-		b.WriteString(`","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"table_id":`)
-		b.WriteString(num(tid))
-		b.WriteString(`,"db":`)
-		b.WriteString(jsonStr(se.db))
-		b.WriteString(`,"table":`)
-		b.WriteString(jsonStr(se.table))
-		b.WriteString(`,"rows":[`)
-		rowno := 0
-		for r.rem() > 0 {
-			nullbm := r.le(nbs)
-			if r.err != nil {
-				break
-			}
-			if rowno > 0 {
-				b.WriteByte(',')
-			}
-			b.WriteByte('[')
-			first := true
-			for i := 0; i < se.columnCount; i++ {
-				if !bit(present1, i) {
-					continue
-				}
-				if !first {
-					b.WriteByte(',')
-				}
-				first = false
-				if bit(nullbm, i) {
-					b.WriteString("null")
-					continue
-				}
-				switch se.columnTypes[i] {
-				case 8: // LONGLONG
-					v := int64(r.le(8))
-					b.WriteString(num(v))
-				case 3: // LONG
-					v := int32(uint32(r.le(4)))
-					b.WriteString(num(v))
-				case 15: // VARCHAR
-					lb := se.varcharLenBytes[i]
-					if lb == 0 {
-						lb = 1
-					}
-					slen := int(r.le(lb))
-					val := r.strn(slen)
-					b.WriteString(jsonStr(val))
-				default:
-					return "", ErrUnsupported
-				}
-				if r.err != nil {
-					break
-				}
-			}
-			b.WriteByte(']')
-			if r.err != nil {
-				break
-			}
-			rowno++
-		}
-		b.WriteString(`]}`)
-
-	case 16: // XID_EVENT
-		xid := r.le(8)
-		b.WriteString(`{"type":"XID_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"xid":`)
-		b.WriteString(num(xid))
-		b.WriteByte('}')
-
-	case 4: // ROTATE_EVENT
-		position := r.le(8)
-		nf := r.strn(r.rem())
-		b.WriteString(`{"type":"ROTATE_EVENT","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"position":`)
-		b.WriteString(num(position))
-		b.WriteString(`,"next_file":`)
-		b.WriteString(jsonStr(nf))
-		b.WriteByte('}')
-
-	default: // UNKNOWN -> safe skip
-		b.WriteString(`{"type":"UNKNOWN","timestamp":`)
-		b.WriteString(num(h.Timestamp))
-		b.WriteString(`,"type_id":`)
-		b.WriteString(num(h.EventType))
-		b.WriteString(`,"event_size":`)
-		b.WriteString(num(h.EventSize))
-		b.WriteByte('}')
+func rowsName(t uint8) string {
+	switch t {
+	case evWriteRowsV2:
+		return "WRITE_ROWS_EVENT_V2"
+	case evUpdateRowsV2:
+		return "UPDATE_ROWS_EVENT_V2"
+	case evDeleteRowsV2:
+		return "DELETE_ROWS_EVENT_V2"
 	}
-	return b.String(), r.err
+	return "ROWS_EVENT_V2"
 }
 
+func parseFDE(r *reader, h *EventHeader, bodyLen int, b *serializer) error {
+	if r.rem() < 2+serverVersion+1 {
+		return ErrTruncated
+	}
+	bv := uint16(r.le(2))
+	tmp := r.raw(serverVersion)
+	alg := r.data[r.len-1]
+	var sv strings.Builder
+	for _, c := range tmp {
+		if c == 0 {
+			break
+		}
+		sv.WriteByte(c)
+	}
+	b.puts(`{"type":"FORMAT_DESCRIPTION_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"binlog_version":`)
+	b.uint(bv)
+	b.puts(`,"server_version":`)
+	b.jsonStr(sv.String())
+	b.puts(`,"checksum_alg":`)
+	b.uint(alg)
+	b.putc('}')
+	return r.err
+}
+
+func parseGTID(r *reader, h *EventHeader, b *serializer) error {
+	r.le(1) // flags
+	sid := r.raw(16)
+	gno := r.le(8)
+	if r.err != nil {
+		return r.err
+	}
+	sh := fmt.Sprintf("%x", sid)
+	b.puts(`{"type":"GTID_LOG_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"gno":`)
+	b.uint(gno)
+	b.puts(`,"sid":`)
+	b.jsonStr(sh)
+	b.putc('}')
+	return nil
+}
+
+func parseQuery(r *reader, h *EventHeader, b *serializer) error {
+	r.le(4) // thread_id
+	r.le(4) // exec_time
+	dbl := int(r.le(1))
+	r.le(2) // error_code
+	svl := int(r.le(2))
+	r.skip(svl) // status_vars
+	db := r.strn(dbl, nameCap)
+	r.le(1) // trailing NUL after db
+	query := r.strn(r.rem(), strCap)
+	if r.err != nil {
+		return r.err
+	}
+	b.puts(`{"type":"QUERY_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"db":`)
+	b.jsonStr(db)
+	b.puts(`,"query":`)
+	b.jsonStr(query)
+	b.putc('}')
+	return nil
+}
+
+func parseRowsQuery(r *reader, h *EventHeader, b *serializer) error {
+	ln := r.lenenc()
+	q := r.strn(int(ln), strCap)
+	if r.err != nil {
+		return r.err
+	}
+	b.puts(`{"type":"ROWS_QUERY_LOG_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"query":`)
+	b.jsonStr(q)
+	b.putc('}')
+	return nil
+}
+
+func parseTableMap(r *reader, h *EventHeader, reg *registry, b *serializer) error {
+	var s schema
+	s.tableID = r.le(6)
+	r.le(2) // flags
+	dbl := int(r.le(1))
+	s.db = r.strn(dbl, nameCap)
+	r.le(1) // NUL
+	tl := int(r.le(1))
+	s.table = r.strn(tl, nameCap)
+	r.le(1) // NUL
+	cc := int(r.lenenc())
+	if r.err != nil {
+		return r.err
+	}
+	if cc == 0 || cc > maxCols {
+		return ErrUnsupported
+	}
+	s.columnCount = cc
+	for i := 0; i < cc; i++ {
+		s.columnTypes = append(s.columnTypes, byte(r.le(1)))
+	}
+	mdLen := int(r.lenenc())
+	mdStart := r.position()
+	if r.err != nil || mdLen > r.len || mdStart > r.len-mdLen {
+		return ErrTruncated
+	}
+	s.varcharLenBytes = make([]int, cc)
+	for i, ct := range s.columnTypes {
+		if ct == typeVarchar {
+			if r.position()+2 > mdStart+mdLen {
+				return ErrTruncated
+			}
+			mx := uint16(r.le(2))
+			if mx > 255 {
+				s.varcharLenBytes[i] = 2
+			} else {
+				s.varcharLenBytes[i] = 1
+			}
+		}
+	}
+	r.setPos(mdStart + mdLen) // skip any extra metadata
+
+	nb := (cc + 7) / 8
+	if nb > 8 {
+		return ErrUnsupported
+	}
+	nullbm := r.le(nb)
+	for i := 0; i < cc; i++ {
+		if bit(nullbm, i) {
+			s.nullableCount++
+		}
+	}
+	if r.err != nil {
+		return r.err
+	}
+	reg.put(s)
+
+	b.puts(`{"type":"TABLE_MAP_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"table_id":`)
+	b.uint(s.tableID)
+	b.puts(`,"db":`)
+	b.jsonStr(s.db)
+	b.puts(`,"table":`)
+	b.jsonStr(s.table)
+	b.puts(`,"column_count":`)
+	b.uint(cc)
+	b.puts(`,"column_types":[`)
+	for i, ct := range s.columnTypes {
+		if i > 0 {
+			b.putc(',')
+		}
+		b.uint(ct)
+	}
+	b.puts(`]}`)
+	return nil
+}
+
+func parseRowsV2(r *reader, h *EventHeader, reg *registry, b *serializer) error {
+	tid := r.le(6)
+	r.le(2) // flags
+	extraLen := int(r.le(2))
+	if extraLen < 2 {
+		return ErrUnsupported
+	}
+	r.skip(extraLen - 2)
+	cc := int(r.lenenc())
+	if r.err != nil {
+		return r.err
+	}
+	if cc == 0 || cc > maxCols {
+		return ErrUnsupported
+	}
+	bmSize := (cc + 7) / 8
+	if bmSize > 8 {
+		return ErrUnsupported
+	}
+	present := r.le(bmSize)
+	if h.EventType == evUpdateRowsV2 {
+		r.le(bmSize) // before/after bitmap (equal in this subset)
+	}
+	if r.err != nil {
+		return r.err
+	}
+	s := reg.get(tid)
+	if s == nil {
+		return ErrNoSchema
+	}
+
+	b.puts(`{"type":"`)
+	b.puts(rowsName(h.EventType))
+	b.puts(`","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"table_id":`)
+	b.uint(tid)
+	b.puts(`,"db":`)
+	b.jsonStr(s.db)
+	b.puts(`,"table":`)
+	b.jsonStr(s.table)
+	return decodeRows(r, s, present, b)
+}
+
+func parseXID(r *reader, h *EventHeader, b *serializer) error {
+	xid := r.le(8)
+	if r.err != nil {
+		return r.err
+	}
+	b.puts(`{"type":"XID_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"xid":`)
+	b.uint(xid)
+	b.putc('}')
+	return nil
+}
+
+func parseRotate(r *reader, h *EventHeader, b *serializer) error {
+	position := r.le(8)
+	nf := r.strn(r.rem(), strCap)
+	if r.err != nil {
+		return r.err
+	}
+	b.puts(`{"type":"ROTATE_EVENT","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"position":`)
+	b.uint(position)
+	b.puts(`,"next_file":`)
+	b.jsonStr(nf)
+	b.putc('}')
+	return nil
+}
+
+func parseUnknown(h *EventHeader, b *serializer) {
+	b.puts(`{"type":"UNKNOWN","timestamp":`)
+	b.uint(h.Timestamp)
+	b.puts(`,"type_id":`)
+	b.uint(h.EventType)
+	b.puts(`,"event_size":`)
+	b.uint(h.EventSize)
+	b.putc('}')
+}
+
+// dispatchEvent sends one verified event body to its named handler.
+func dispatchEvent(h *EventHeader, body []byte, reg *registry, b *serializer) error {
+	r := newReader(body)
+	switch h.EventType {
+	case evFormatDesc:
+		return parseFDE(r, h, len(body), b)
+	case evGtid:
+		return parseGTID(r, h, b)
+	case evQuery:
+		return parseQuery(r, h, b)
+	case evRowsQuery:
+		return parseRowsQuery(r, h, b)
+	case evTableMap:
+		return parseTableMap(r, h, reg, b)
+	case evWriteRowsV2, evUpdateRowsV2, evDeleteRowsV2:
+		return parseRowsV2(r, h, reg, b)
+	case evXid:
+		return parseXID(r, h, b)
+	case evRotate:
+		return parseRotate(r, h, b)
+	default: // UNKNOWN -> safe skip, stable one-line record
+		parseUnknown(h, b)
+		return nil
+	}
+}
+
+// ==================================================================
+// [7] Public API: whole-buffer parser.
+// ==================================================================
 // ParseBuffer parses a whole binlog buffer and writes canonical JSONL lines
 // (one per event) to out.
 func ParseBuffer(data []byte, out io.Writer) error {
-	if len(data) < 4 {
+	if len(data) < magicSize {
 		return ErrInvalid
 	}
-	if !(data[0] == 0xFE && data[1] == 'b' && data[2] == 'i' && data[3] == 'n') {
+	if data[0] != magic[0] || data[1] != magic[1] ||
+		data[2] != magic[2] || data[3] != magic[3] {
 		return ErrInvalid
 	}
+
 	var reg registry
-	pos := 4 // skip magic
+	pos := magicSize
 	for pos < len(data) {
-		if pos+19 > len(data) {
+		if len(data)-pos < headerSize {
 			return ErrTruncated
 		}
-		h, err := ParseHeader(data[pos : pos+19])
+		h, err := ParseHeader(data[pos : pos+headerSize])
 		if err != nil {
 			return err
 		}
 		es := int(h.EventSize)
-		if es < 19+4 || pos+es > len(data) {
+		if es < headerSize+crcSize || es > maxEventSize || es > len(data)-pos {
 			return ErrTruncated
 		}
 		full := data[pos : pos+es]
-		// Controlled subset: every event carries CRC32 (FDE declares alg=1).
-		stored := binary.LittleEndian.Uint32(full[es-4:])
-		calc := CRC32(full[:es-4])
+		// Every event in the controlled subset carries CRC32 (FDE declares
+		// checksum_alg=1), so it is verified unconditionally here.
+		stored := binary.LittleEndian.Uint32(full[es-crcSize:])
+		calc := CRC32(full[:es-crcSize])
 		if stored != calc {
 			return ErrChecksum
 		}
-		body := full[19 : es-4]
-		r := newReader(body)
-		line, err := emit(&h, body, r, &reg)
-		if err != nil {
+
+		body := full[headerSize : es-crcSize]
+		b := newSerializer()
+		if err := dispatchEvent(&h, body, &reg, b); err != nil {
 			return err
 		}
-		fmt.Fprintln(out, line)
+		if b.overflow {
+			return ErrInvalid
+		}
+		fmt.Fprintln(out, b.line())
 		pos += es
 	}
 	return nil
